@@ -1,6 +1,6 @@
 # Mencoba paket build iZotay
 
-Paket GitHub Release adalah build preview publik untuk mencoba prototipe, bukan installer final. Isinya executable iZotay, panduan paket ini, dan [Panduan Pengguna](PANDUAN-PENGGUNA.md). FFmpeg tidak disertakan.
+Paket GitHub Release adalah build preview publik untuk mencoba iZotay. Setiap platform menyediakan arsip portable dan paket instalasi: Windows Setup (`.exe`), Linux Debian (`.deb`), serta macOS disk image (`.dmg`). FFmpeg tidak disertakan.
 
 ## Persyaratan
 
@@ -10,10 +10,10 @@ Paket GitHub Release adalah build preview publik untuk mencoba prototipe, bukan 
 
 ## Menjalankan
 
-- **Windows:** ekstrak ZIP, lalu jalankan `izotay.exe`.
-- **macOS:** ekstrak arsip, buka Terminal di folder hasil ekstrak, lalu jalankan `./izotay`. Binary preview ini belum ditandatangani atau notarized.
-- **Linux:** ekstrak arsip lalu jalankan `./izotay`. Jika perlu, beri izin executable dengan `chmod +x izotay`.
+- **Windows:** jalankan `izotay-Windows-X64-setup.exe`, atau ekstrak ZIP dan jalankan `izotay.exe`. Installer menambahkan shortcut Start Menu dan menawarkan shortcut desktop.
+- **macOS:** buka DMG lalu salin `Izotay.app` ke Applications, atau ekstrak tar.gz dan jalankan `./izotay` dari Terminal. Aplikasi preview belum ditandatangani atau notarized; macOS dapat meminta pengguna mengizinkannya melalui Privacy & Security.
+- **Linux Debian/Ubuntu:** pasang paket dengan `sudo apt install ./izotay-Linux-X64.deb`; paket portable `.tar.gz` juga tersedia. Distribusi Linux lain dapat menjalankan `./izotay` dari arsip setelah `chmod +x izotay`.
 
 > Aplikasi menyimpan edit dalam sesi dan membuat file output baru. File media sumber tidak ditimpa.
 
-Paket ini belum berupa installer dan belum untuk distribusi publik. Lisensi dependency, penandatanganan kode, dan packaging final masih perlu ditinjau.
+Paket instalasi mengatur binary dan dokumentasi aplikasi, tetapi tidak membawa FFmpeg. Paket preview belum ditandatangani; lisensi dependency dan kompatibilitas runtime pada setiap distribusi tetap perlu ditinjau sebelum distribusi produksi.

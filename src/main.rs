@@ -527,6 +527,43 @@ fn new_track_id() -> u64 {
 fn default_bleed_reduction() -> f32 {
     12.0
 }
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct EqBand {
+    frequency_hz: f32,
+    gain_db: f32,
+    q: f32,
+    enabled: bool,
+}
+
+fn default_eq_bands() -> Vec<EqBand> {
+    [60.0, 180.0, 500.0, 1_500.0, 4_500.0, 12_000.0]
+        .into_iter()
+        .map(|frequency_hz| EqBand {
+            frequency_hz,
+            gain_db: 0.0,
+            q: 0.9,
+            enabled: true,
+        })
+        .collect()
+}
+
+fn eq_bands_valid(bands: &[EqBand]) -> bool {
+    bands.len() <= 12
+        && bands.iter().all(|band| {
+            band.frequency_hz.is_finite()
+                && (20.0..=20_000.0).contains(&band.frequency_hz)
+                && band.gain_db.is_finite()
+                && (-18.0..=18.0).contains(&band.gain_db)
+                && band.q.is_finite()
+                && (0.25..=8.0).contains(&band.q)
+        })
+}
+
+fn default_eq_bypass() -> bool {
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct TrackSettings {
     #[serde(default = "new_track_id")]
@@ -569,6 +606,10 @@ struct TrackSettings {
     dereverb_enabled: bool,
     #[serde(default = "default_dereverb_amount")]
     dereverb_amount: f32,
+    #[serde(default = "default_eq_bands")]
+    eq_bands: Vec<EqBand>,
+    #[serde(default = "default_eq_bypass")]
+    eq_bypass: bool,
     #[serde(default)]
     gain_automation: Vec<GainPoint>,
     #[serde(default)]
@@ -610,6 +651,10 @@ struct EffectSettings {
     dereverb_enabled: bool,
     #[serde(default = "default_dereverb_amount")]
     dereverb_amount: f32,
+    #[serde(default = "default_eq_bands")]
+    eq_bands: Vec<EqBand>,
+    #[serde(default = "default_eq_bypass")]
+    eq_bypass: bool,
     #[serde(default)]
     bleed_enabled: bool,
     #[serde(default)]
@@ -638,6 +683,8 @@ impl TrackSettings {
             deesser_reduction_db: self.deesser_reduction_db,
             dereverb_enabled: self.dereverb_enabled,
             dereverb_amount: self.dereverb_amount,
+            eq_bands: self.eq_bands.clone(),
+            eq_bypass: self.eq_bypass,
             bleed_enabled: self.bleed_enabled,
             bleed_reference_track_id: self.bleed_reference_track_id,
             bleed_reduction_db: self.bleed_reduction_db,
@@ -661,6 +708,8 @@ impl TrackSettings {
         self.deesser_reduction_db = effects.deesser_reduction_db;
         self.dereverb_enabled = effects.dereverb_enabled;
         self.dereverb_amount = effects.dereverb_amount;
+        self.eq_bands = effects.eq_bands.clone();
+        self.eq_bypass = effects.eq_bypass;
         self.bleed_enabled = effects.bleed_enabled;
         self.bleed_reference_track_id = effects.bleed_reference_track_id;
         self.bleed_reduction_db = effects.bleed_reduction_db;
@@ -692,6 +741,8 @@ fn new_track_settings(name: String, path: String, duration: f64) -> TrackSetting
         deesser_reduction_db: default_deesser_reduction(),
         dereverb_enabled: false,
         dereverb_amount: default_dereverb_amount(),
+        eq_bands: default_eq_bands(),
+        eq_bypass: default_eq_bypass(),
         gain_automation: Vec::new(),
         bleed_enabled: false,
         bleed_reference_track_id: None,
@@ -1305,6 +1356,7 @@ struct App {
     selected_track: Option<usize>,
     selected_clip: Option<(usize, usize)>,
     selected_marker: Option<usize>,
+    selected_eq_band: usize,
     playhead_seconds: f64,
     timeline_zoom: f32,
     snap_enabled: bool,
@@ -1347,6 +1399,16 @@ struct App {
     session_opening: bool,
     consolidation_result: Option<Receiver<Result<ConsolidationResult, String>>>,
     consolidation_in_progress: bool,
+    video_preview_result: Option<Receiver<VideoPreviewResult>>,
+    video_preview_cancel: Option<Arc<AtomicBool>>,
+    video_preview_key: Option<(u64, i64, String)>,
+    video_preview_texture: Option<egui::TextureHandle>,
+    video_preview_texture_key: Option<(u64, String)>,
+    video_preview_message: Option<String>,
+}
+struct VideoPreviewResult {
+    key: (u64, i64, String),
+    result: Result<Vec<u8>, String>,
 }
 struct ConsolidationResult {
     paths: Vec<String>,
@@ -1368,6 +1430,7 @@ impl Default for App {
             selected_track: None,
             selected_clip: None,
             selected_marker: None,
+            selected_eq_band: 0,
             playhead_seconds: 0.0,
             timeline_zoom: 1.0,
             snap_enabled: false,
@@ -1410,10 +1473,185 @@ impl Default for App {
             session_opening: false,
             consolidation_result: None,
             consolidation_in_progress: false,
+            video_preview_result: None,
+            video_preview_cancel: None,
+            video_preview_key: None,
+            video_preview_texture: None,
+            video_preview_texture_key: None,
+            video_preview_message: None,
         }
     }
 }
 impl App {
+    fn update_video_preview(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.video_preview_result {
+            match receiver.try_recv() {
+                Ok(message) => {
+                    self.video_preview_result = None;
+                    self.video_preview_cancel = None;
+                    if self.video_preview_key.as_ref() == Some(&message.key) {
+                        match message.result {
+                            Ok(pixels) => {
+                                let image = egui::ColorImage::from_rgb([640, 360], &pixels);
+                                self.video_preview_texture_key =
+                                    Some((message.key.0, message.key.2.clone()));
+                                if let Some(texture) = &mut self.video_preview_texture {
+                                    texture.set(image, egui::TextureOptions::LINEAR);
+                                } else {
+                                    self.video_preview_texture = Some(ctx.load_texture(
+                                        "izotay-video-preview",
+                                        image,
+                                        egui::TextureOptions::LINEAR,
+                                    ));
+                                }
+                                self.video_preview_message = None;
+                            }
+                            Err(error) => self.video_preview_message = Some(error),
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.video_preview_result = None;
+                    self.video_preview_cancel = None;
+                    self.video_preview_message = Some("Worker preview video terhenti".into());
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        let candidate = self.selected_track.and_then(|index| {
+            let track = self.tracks.get(index)?;
+            if track.offline || !is_video_file(std::path::Path::new(&track.settings.path)) {
+                return None;
+            }
+            let clip = track.settings.clips.iter().find(|clip| {
+                let end = clip.position + clip.source_end - clip.source_start;
+                self.playhead_seconds >= clip.position && self.playhead_seconds < end
+            })?;
+            let source_time = clip.source_start + self.playhead_seconds - clip.position;
+            let bucket = (source_time * 2.0).floor() as i64;
+            Some((
+                track.settings.track_id,
+                bucket,
+                track.settings.path.clone(),
+                source_time,
+            ))
+        });
+        let Some((track_id, bucket, path, source_time)) = candidate else {
+            if let Some(cancel) = self.video_preview_cancel.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.video_preview_result = None;
+            self.video_preview_key = None;
+            self.video_preview_message = None;
+            return;
+        };
+        let key = (track_id, bucket, path.clone());
+        if self.video_preview_key.as_ref() == Some(&key) {
+            return;
+        }
+        if let Some(cancel) = self.video_preview_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker_key = key.clone();
+        std::thread::Builder::new()
+            .name("izotay-video-frame".into())
+            .spawn(move || {
+                let result = (|| {
+                    let mut child = std::process::Command::new("ffmpeg")
+                        .args([
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-nostdin",
+                            "-ss",
+                        ])
+                        .arg(format!("{source_time:.3}"))
+                        .args(["-i"])
+                        .arg(&path)
+                        .args([
+                            "-an",
+                            "-sn",
+                            "-dn",
+                            "-frames:v",
+                            "1",
+                            "-vf",
+                            "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2",
+                            "-pix_fmt",
+                            "rgb24",
+                            "-f",
+                            "rawvideo",
+                            "pipe:1",
+                        ])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .map_err(|error| {
+                            if error.kind() == std::io::ErrorKind::NotFound {
+                                "Pasang FFmpeg untuk menampilkan preview video".to_owned()
+                            } else {
+                                format!("Gagal memulai preview video: {error}")
+                            }
+                        })?;
+                    let mut stdout = child
+                        .stdout
+                        .take()
+                        .ok_or_else(|| "Output preview video tidak tersedia".to_owned())?;
+                    let reader = std::thread::spawn(move || {
+                        use std::io::Read;
+                        let mut pixels = vec![0_u8; 640 * 360 * 3];
+                        stdout.read_exact(&mut pixels).map(|()| pixels)
+                    });
+                    loop {
+                        if worker_cancelled.load(Ordering::Relaxed) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = reader.join();
+                            return Err("Preview dibatalkan".to_owned());
+                        }
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                let pixels = reader
+                                    .join()
+                                    .map_err(|_| "Worker pembacaan frame gagal".to_owned())?
+                                    .map_err(|_| "FFmpeg tidak menghasilkan frame video".to_owned())?;
+                                if !status.success() {
+                                    return Err("Frame video gagal dibaca oleh FFmpeg".to_owned());
+                                }
+                                return Ok(pixels);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                let _ = reader.join();
+                                return Err(format!("Tidak dapat memantau FFmpeg: {error}"));
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                })();
+                if !worker_cancelled.load(Ordering::Relaxed) {
+                    let _ = sender.send(VideoPreviewResult {
+                        key: worker_key,
+                        result,
+                    });
+                }
+            })
+            .expect("gagal membuat worker preview video");
+        self.video_preview_key = Some(key);
+        self.video_preview_result = Some(receiver);
+        self.video_preview_cancel = Some(cancelled);
+        self.video_preview_message = Some("Memuat frame video…".into());
+    }
+
     fn snapshot(&self) -> EditorSnapshot {
         EditorSnapshot {
             tracks: self.tracks.clone(),
@@ -2084,7 +2322,7 @@ impl App {
     }
     fn write_session_to(&self, path: &std::path::Path) -> Result<(), String> {
         let session = SessionFile {
-            format_version: 17,
+            format_version: 18,
             sample_rate: self
                 .tracks
                 .first()
@@ -2141,7 +2379,7 @@ impl App {
             return;
         };
         let session = SessionFile {
-            format_version: 17,
+            format_version: 18,
             sample_rate: self
                 .tracks
                 .first()
@@ -2260,7 +2498,7 @@ impl App {
                             std::fs::read(&source_path).map_err(|error| error.to_string())?;
                         let mut session: SessionFile = serde_json::from_slice(&data)
                             .map_err(|error| format!("Sesi tidak valid: {error}"))?;
-                        if !(1..=17).contains(&session.format_version) {
+                        if !(1..=18).contains(&session.format_version) {
                             return Err(format!(
                                 "Versi sesi {} belum didukung",
                                 session.format_version
@@ -2340,6 +2578,7 @@ impl App {
                                         || !point.gain.is_finite()
                                         || !(0.0..=4.0).contains(&point.gain)
                                 })
+                                || !eq_bands_valid(&settings.eq_bands)
                             {
                                 return Err(format!(
                                     "Pengaturan restorasi track {:?} tidak valid",
@@ -2488,6 +2727,7 @@ impl App {
                                     || effect.bleed_reference_track_id.is_some_and(|reference_id| {
                                         !track_ids.contains(&reference_id)
                                     })
+                                    || !eq_bands_valid(&effect.eq_bands)
                                     || effect.denoise_profile_range.is_some_and(|(start, end)| {
                                         !start.is_finite()
                                             || !end.is_finite()
@@ -3157,6 +3397,7 @@ fn extend_time_selection(
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_video_preview(ctx);
         self.poll_mix();
         self.poll_export();
         self.poll_import();
@@ -3693,6 +3934,41 @@ impl eframe::App for App {
                 ui.heading("Inspector");
                 ui.label("Pengaturan klip dan track terpilih");
                 ui.separator();
+                if let Some(index) = self.selected_track
+                    && self.tracks.get(index).is_some_and(|track| {
+                        is_video_file(std::path::Path::new(&track.settings.path))
+                    })
+                {
+                    ui.strong("Preview video");
+                    let width = ui.available_width().max(1.0);
+                    let selected_video_key = self.selected_track.and_then(|index| {
+                        self.tracks.get(index).map(|track| {
+                            (track.settings.track_id, track.settings.path.clone())
+                        })
+                    });
+                    if let Some(texture) = &self.video_preview_texture
+                        && self.video_preview_texture_key == selected_video_key
+                    {
+                        ui.image((texture.id(), egui::vec2(width, width * 9.0 / 16.0)));
+                    } else {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(width, width * 9.0 / 16.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter()
+                            .rect_filled(rect, 4.0, egui::Color32::from_rgb(13, 18, 19));
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            self.video_preview_message
+                                .as_deref()
+                                .unwrap_or("Frame video muncul saat playhead berada di klip"),
+                            egui::FontId::proportional(12.0),
+                            ui.visuals().weak_text_color(),
+                        );
+                    }
+                    ui.separator();
+                }
                 if let Some((track_index, clip_index)) = self.selected_clip {
                     if let Some(track) = self.tracks.get_mut(track_index)
                         && let Some(clip) = track.settings.clips.get_mut(clip_index)
@@ -3759,6 +4035,15 @@ impl eframe::App for App {
                             inspector_changed |=
                                 ui.checkbox(&mut track.settings.solo, "Solo").changed();
                         });
+                        ui.collapsing("Equalizer 6-band", |ui| {
+                            inspector_changed |= draw_equalizer(
+                                ui,
+                                &mut track.settings.eq_bands,
+                                &mut track.settings.eq_bypass,
+                                &mut self.selected_eq_band,
+                                track.audio.sample_rate,
+                            );
+                        });
                         ui.collapsing("Otomasi gain", |ui| {
                             ui.add(
                                 egui::Slider::new(&mut self.automation_gain_value, 0.0..=4.0)
@@ -3807,6 +4092,12 @@ impl eframe::App for App {
                                 + usize::from(track.settings.declip_enabled)
                                 + usize::from(track.settings.deesser_enabled)
                                 + usize::from(track.settings.dereverb_enabled)
+                                + usize::from(
+                                    !track.settings.eq_bypass
+                                        && track.settings.eq_bands.iter().any(|band| {
+                                            band.enabled && band.gain_db.abs() > 0.001
+                                        }),
+                                )
                                 + usize::from(track.settings.bleed_enabled);
                             ui.label(format!(
                                 "{active} efek restorasi aktif"
@@ -4132,6 +4423,12 @@ impl eframe::App for App {
                             + usize::from(track.settings.declip_enabled)
                             + usize::from(track.settings.deesser_enabled)
                             + usize::from(track.settings.dereverb_enabled)
+                            + usize::from(
+                                !track.settings.eq_bypass
+                                    && track.settings.eq_bands.iter().any(|band| {
+                                        band.enabled && band.gain_db.abs() > 0.001
+                                    }),
+                            )
                             + usize::from(track.settings.bleed_enabled);
                         ui.collapsing(
                             format!("Restorasi · {active_restoration_count} aktif"),
@@ -4933,6 +5230,7 @@ fn validate_preset_effects(mut effects: EffectSettings) -> Result<EffectSettings
         || !(0.0..=18.0).contains(&effects.deesser_reduction_db)
         || !effects.dereverb_amount.is_finite()
         || !(0.0..=1.0).contains(&effects.dereverb_amount)
+        || !eq_bands_valid(&effects.eq_bands)
     {
         return Err("Preset memiliki nilai restorasi di luar rentang yang didukung".into());
     }
@@ -5509,6 +5807,213 @@ fn repair_sample(
     }
 }
 
+#[derive(Clone, Copy)]
+struct EqCoefficients {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+impl EqCoefficients {
+    fn peaking(sample_rate: u32, band: EqBand) -> Option<Self> {
+        if sample_rate < 42 {
+            return None;
+        }
+        let frequency = band
+            .frequency_hz
+            .clamp(20.0, (sample_rate as f32 * 0.49).min(20_000.0));
+        let gain_db = band.gain_db.clamp(-18.0, 18.0);
+        let q = band.q.clamp(0.25, 8.0);
+        if !frequency.is_finite() || !gain_db.is_finite() || !q.is_finite() {
+            return None;
+        }
+        let amplitude = 10.0f32.powf(gain_db / 40.0);
+        let omega = std::f32::consts::TAU * frequency / sample_rate as f32;
+        let alpha = omega.sin() / (2.0 * q);
+        let cosine = omega.cos();
+        let a0 = 1.0 + alpha / amplitude;
+        (a0.is_finite() && a0.abs() > 1e-8).then_some(Self {
+            b0: (1.0 + alpha * amplitude) / a0,
+            b1: (-2.0 * cosine) / a0,
+            b2: (1.0 - alpha * amplitude) / a0,
+            a1: (-2.0 * cosine) / a0,
+            a2: (1.0 - alpha / amplitude) / a0,
+        })
+    }
+}
+
+fn eq_response_db(frequency_hz: f32, sample_rate: u32, band: EqBand) -> f32 {
+    let Some(filter) = EqCoefficients::peaking(sample_rate, band) else {
+        return 0.0;
+    };
+    let omega = std::f32::consts::TAU * frequency_hz / sample_rate.max(1) as f32;
+    let cosine = omega.cos();
+    let sine = omega.sin();
+    let cosine2 = (2.0 * omega).cos();
+    let sine2 = (2.0 * omega).sin();
+    let numerator_real = filter.b0 + filter.b1 * cosine + filter.b2 * cosine2;
+    let numerator_imag = -filter.b1 * sine - filter.b2 * sine2;
+    let denominator_real = 1.0 + filter.a1 * cosine + filter.a2 * cosine2;
+    let denominator_imag = -filter.a1 * sine - filter.a2 * sine2;
+    let numerator = (numerator_real * numerator_real + numerator_imag * numerator_imag).sqrt();
+    let denominator =
+        (denominator_real * denominator_real + denominator_imag * denominator_imag).sqrt();
+    20.0 * (numerator / denominator.max(1e-8)).log10()
+}
+
+fn draw_equalizer(
+    ui: &mut egui::Ui,
+    bands: &mut Vec<EqBand>,
+    bypass: &mut bool,
+    selected_band: &mut usize,
+    sample_rate: u32,
+) -> bool {
+    if bands.is_empty() {
+        *bands = default_eq_bands();
+    }
+    bands.truncate(12);
+    let mut changed = ui.checkbox(bypass, "Bypass equalizer").changed();
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(220.0), 176.0),
+        egui::Sense::hover(),
+    );
+    let plot = rect.shrink2(egui::vec2(24.0, 15.0));
+    let painter = ui.painter_at(rect);
+    let background = egui::Color32::from_rgb(13, 18, 19);
+    let grid = egui::Color32::from_rgb(42, 53, 54);
+    let muted = ui.visuals().weak_text_color();
+    let accent = egui::Color32::from_rgb(63, 197, 168);
+    painter.rect_filled(rect, 5.0, background);
+    let x_for_frequency = |frequency: f32| {
+        let fraction = (frequency.clamp(20.0, 20_000.0) / 20.0).ln() / 1000.0f32.ln();
+        plot.left() + plot.width() * fraction
+    };
+    let y_for_gain = |gain: f32| plot.bottom() - plot.height() * ((gain + 18.0) / 36.0);
+    for gain in [-18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0] {
+        let y = y_for_gain(gain);
+        painter.line_segment(
+            [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+            egui::Stroke::new(if gain == 0.0 { 1.2_f32 } else { 0.7_f32 }, grid),
+        );
+        painter.text(
+            egui::pos2(rect.left() + 2.0, y),
+            egui::Align2::LEFT_CENTER,
+            format!("{gain:.0}"),
+            egui::FontId::proportional(9.0),
+            muted,
+        );
+    }
+    for frequency in [
+        20.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 20_000.0,
+    ] {
+        let x = x_for_frequency(frequency);
+        painter.line_segment(
+            [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+            egui::Stroke::new(0.7_f32, grid),
+        );
+        let label = if frequency >= 1_000.0 {
+            format!("{}k", (frequency / 1_000.0).round() as u32)
+        } else {
+            format!("{frequency:.0}")
+        };
+        painter.text(
+            egui::pos2(x, rect.bottom() - 1.0),
+            egui::Align2::CENTER_BOTTOM,
+            label,
+            egui::FontId::proportional(8.5),
+            muted,
+        );
+    }
+    if !*bypass {
+        let points = (0..=160)
+            .map(|step| {
+                let fraction = step as f32 / 160.0;
+                let frequency = 20.0 * 1_000.0f32.powf(fraction);
+                let gain = bands
+                    .iter()
+                    .filter(|band| band.enabled && band.gain_db.abs() > 0.001)
+                    .map(|band| eq_response_db(frequency, sample_rate, *band))
+                    .sum::<f32>()
+                    .clamp(-18.0, 18.0);
+                egui::pos2(plot.left() + plot.width() * fraction, y_for_gain(gain))
+            })
+            .collect::<Vec<_>>();
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(100, 218, 190)),
+        ));
+    }
+    *selected_band = (*selected_band).min(bands.len().saturating_sub(1));
+    for (index, band) in bands.iter_mut().enumerate() {
+        let point = egui::pos2(x_for_frequency(band.frequency_hz), y_for_gain(band.gain_db));
+        let handle = egui::Rect::from_center_size(point, egui::vec2(16.0, 16.0));
+        let response = ui.interact(
+            handle.expand(4.0),
+            egui::Id::new(("izotay-eq-band", index)),
+            egui::Sense::click_and_drag(),
+        );
+        if response.clicked() || response.dragged() {
+            *selected_band = index;
+        }
+        if response.dragged()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let x_fraction = ((pointer.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+            let frequency = 20.0 * 1_000.0f32.powf(x_fraction);
+            let gain =
+                (((plot.bottom() - pointer.y) / plot.height()) * 36.0 - 18.0).clamp(-18.0, 18.0);
+            if (band.frequency_hz - frequency).abs() > 0.5 || (band.gain_db - gain).abs() > 0.05 {
+                band.frequency_hz = frequency;
+                band.gain_db = gain;
+                changed = true;
+            }
+        }
+        let point = egui::pos2(x_for_frequency(band.frequency_hz), y_for_gain(band.gain_db));
+        let color = if band.enabled { accent } else { muted };
+        painter.circle_filled(
+            point,
+            if index == *selected_band { 6.0 } else { 4.5 },
+            color,
+        );
+        painter.circle_stroke(
+            point,
+            if index == *selected_band { 8.0 } else { 6.0 },
+            egui::Stroke::new(1.0_f32, background),
+        );
+    }
+    if let Some(band) = bands.get_mut(*selected_band) {
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(&mut band.enabled, format!("Band {}", *selected_band + 1))
+                .changed();
+        });
+        let max_frequency = (sample_rate as f32 * 0.49).min(20_000.0).max(20.0);
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut band.frequency_hz, 20.0..=max_frequency)
+                    .logarithmic(true)
+                    .text("Frekuensi Hz"),
+            )
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut band.gain_db, -18.0..=18.0).text("Gain dB"))
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut band.q, 0.25..=8.0)
+                    .logarithmic(true)
+                    .text("Lebar Q"),
+            )
+            .changed();
+    }
+    ui.weak(
+        "Seret titik untuk mengatur frekuensi dan gain. Perubahan terdengar di preview dan ekspor.",
+    );
+    changed
+}
+
 fn process_stage3_effects(
     samples: &[f32],
     channels: usize,
@@ -5520,6 +6025,11 @@ fn process_stage3_effects(
         && !settings.declip_enabled
         && !settings.deesser_enabled
         && !settings.dereverb_enabled
+        && (settings.eq_bypass
+            || !settings
+                .eq_bands
+                .iter()
+                .any(|band| band.enabled && band.gain_db.abs() > 0.001))
     {
         return Ok(samples.to_vec());
     }
@@ -5539,6 +6049,17 @@ fn process_stage3_effects(
     let deesser_threshold = 10.0f32.powf(settings.deesser_threshold_db.clamp(-60.0, 0.0) / 20.0);
     let reduction = 1.0 - 10.0f32.powf(-settings.deesser_reduction_db.clamp(0.0, 18.0) / 20.0);
     let reverb_amount = settings.dereverb_amount.clamp(0.0, 1.0);
+    let eq_filters = if settings.eq_bypass {
+        Vec::new()
+    } else {
+        settings
+            .eq_bands
+            .iter()
+            .filter(|band| band.enabled && band.gain_db.abs() > 0.001)
+            .filter_map(|band| EqCoefficients::peaking(sample_rate, *band))
+            .collect::<Vec<_>>()
+    };
+    let mut eq_state = vec![vec![[0.0f32; 2]; channels]; eq_filters.len()];
     for frame in 0..frames {
         if frame % 16_384 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Err("Render mix dibatalkan".into());
@@ -5586,6 +6107,17 @@ fn process_stage3_effects(
                 output[start + channel] *= attenuation;
             }
         }
+        for (filter_index, filter) in eq_filters.iter().enumerate() {
+            for channel in 0..channels {
+                let index = start + channel;
+                let input = output[index];
+                let state = &mut eq_state[filter_index][channel];
+                let result = filter.b0 * input + state[0];
+                state[0] = filter.b1 * input - filter.a1 * result + state[1];
+                state[1] = filter.b2 * input - filter.a2 * result;
+                output[index] = if result.is_finite() { result } else { input };
+            }
+        }
     }
     Ok(output)
 }
@@ -5612,6 +6144,13 @@ fn pre_effect_cache_path(
     settings.deesser_reduction_db.to_bits().hash(&mut hasher);
     settings.dereverb_enabled.hash(&mut hasher);
     settings.dereverb_amount.to_bits().hash(&mut hasher);
+    settings.eq_bypass.hash(&mut hasher);
+    for band in &settings.eq_bands {
+        band.frequency_hz.to_bits().hash(&mut hasher);
+        band.gain_db.to_bits().hash(&mut hasher);
+        band.q.to_bits().hash(&mut hasher);
+        band.enabled.hash(&mut hasher);
+    }
     Some(
         std::env::temp_dir()
             .join("izotay-source-cache")
@@ -5689,6 +6228,17 @@ fn cache_pre_effects(
     let deesser_attack = 1.0 - (-1.0 / (sample_rate as f32 * 0.003)).exp();
     let deesser_release = 1.0 - (-1.0 / (sample_rate as f32 * 0.045)).exp();
     let dereverb_release = 1.0 - (-1.0 / (sample_rate as f32 * 0.35)).exp();
+    let eq_filters = if settings.eq_bypass {
+        Vec::new()
+    } else {
+        settings
+            .eq_bands
+            .iter()
+            .filter(|band| band.enabled && band.gain_db.abs() > 0.001)
+            .filter_map(|band| EqCoefficients::peaking(sample_rate, *band))
+            .collect::<Vec<_>>()
+    };
+    let mut eq_state = vec![vec![[0.0f32; 2]; channels]; eq_filters.len()];
 
     for frame_index in 0..frame_count {
         if frame_index % 16_384 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -5777,6 +6327,20 @@ fn cache_pre_effects(
                 *sample *= attenuation;
             }
         }
+        for (filter_index, filter) in eq_filters.iter().enumerate() {
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                let state = &mut eq_state[filter_index][channel];
+                let input = *sample;
+                let filtered = filter.b0 * input + state[0];
+                state[0] = filter.b1 * input - filter.a1 * filtered + state[1];
+                state[1] = filter.b2 * input - filter.a2 * filtered;
+                *sample = if filtered.is_finite() {
+                    filtered
+                } else {
+                    input
+                };
+            }
+        }
         for sample in &frame {
             output.append_sample(*sample)?;
         }
@@ -5798,7 +6362,12 @@ fn cached_pre_effect_samples(
         || settings.declick_enabled
         || settings.declip_enabled
         || settings.deesser_enabled
-        || settings.dereverb_enabled;
+        || settings.dereverb_enabled
+        || (!settings.eq_bypass
+            && settings
+                .eq_bands
+                .iter()
+                .any(|band| band.enabled && band.gain_db.abs() > 0.001));
     if !needs_processing {
         return Ok(source.clone());
     }
@@ -6578,6 +7147,14 @@ impl Drop for SourceCacheWriter {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(cancelled) = &self.video_preview_cancel {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 #[cfg(test)]
 fn read_wav(path: &std::path::Path) -> Result<Audio, String> {
     read_wav_controlled(path, None)
@@ -7345,7 +7922,7 @@ mod tests {
         SessionFile, SpectrogramCache, Track, TrackSettings, WaveformCache, build_spectrogram,
         cached_denoise_samples_controlled, cached_pre_effect_samples, consolidate_session_bundle,
         default_bleed_reduction, default_deesser_reduction, default_deesser_threshold,
-        default_dereverb_amount, denoise_cache_path, estimate_alignment_offset,
+        default_dereverb_amount, default_eq_bands, denoise_cache_path, estimate_alignment_offset,
         estimate_bleed_weights, expander_samples, gain_at_time, highpass_samples,
         make_render_state, mux_edited_audio_into_mp4, new_track_id, noise_profile_range, peak_data,
         peak_data_controlled, pre_effect_cache_path, prepare_mix_playback,
@@ -7381,6 +7958,8 @@ mod tests {
             deesser_reduction_db: 6.0,
             dereverb_enabled: false,
             dereverb_amount: 0.35,
+            eq_bands: default_eq_bands(),
+            eq_bypass: true,
             gain_automation: Vec::new(),
             bleed_enabled: false,
             bleed_reference_track_id: None,
@@ -7769,6 +8348,8 @@ mod tests {
             deesser_reduction_db: default_deesser_reduction(),
             dereverb_enabled: false,
             dereverb_amount: default_dereverb_amount(),
+            eq_bands: default_eq_bands(),
+            eq_bypass: true,
             gain_automation: Vec::new(),
             bleed_enabled: false,
             bleed_reference_track_id: None,
@@ -7865,6 +8446,8 @@ mod tests {
             deesser_reduction_db: default_deesser_reduction(),
             dereverb_enabled: true,
             dereverb_amount: default_dereverb_amount(),
+            eq_bands: default_eq_bands(),
+            eq_bypass: true,
             gain_automation: Vec::new(),
             bleed_enabled: false,
             bleed_reference_track_id: None,
@@ -8062,6 +8645,8 @@ mod tests {
             deesser_reduction_db: default_deesser_reduction(),
             dereverb_enabled: false,
             dereverb_amount: default_dereverb_amount(),
+            eq_bands: default_eq_bands(),
+            eq_bypass: true,
             gain_automation: Vec::new(),
             bleed_enabled: false,
             bleed_reference_track_id: None,
@@ -8433,6 +9018,8 @@ mod tests {
                 deesser_reduction_db: default_deesser_reduction(),
                 dereverb_enabled: true,
                 dereverb_amount: default_dereverb_amount(),
+                eq_bands: default_eq_bands(),
+                eq_bypass: true,
                 gain_automation: vec![
                     GainPoint {
                         time: 1.0,
@@ -8474,7 +9061,7 @@ mod tests {
         app.tracks.push(reference_track);
         app.write_session_to(&path).unwrap();
         let session: SessionFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(session.format_version, 17);
+        assert_eq!(session.format_version, 18);
         assert_eq!(session.tracks.len(), 2);
         assert_eq!(session.tracks[0].denoise_profile_range, Some((1.25, 2.75)));
         assert!(session.tracks[0].declick_enabled);
@@ -8654,6 +9241,8 @@ mod tests {
                 deesser_reduction_db: default_deesser_reduction(),
                 dereverb_enabled: false,
                 dereverb_amount: default_dereverb_amount(),
+                eq_bands: default_eq_bands(),
+                eq_bypass: true,
                 gain_automation: Vec::new(),
                 bleed_enabled: false,
                 bleed_reference_track_id: None,

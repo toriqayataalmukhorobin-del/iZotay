@@ -6,7 +6,7 @@ iZotay adalah editor desktop lokal untuk menyunting dialog, podcast, wawancara, 
 
 - Jalankan iZotay pada sesi desktop aktif dengan perangkat output audio yang berfungsi.
 - WAV dapat dibuka langsung. Pasang FFmpeg dan pastikan perintah `ffmpeg` tersedia di `PATH` untuk format audio/video lain, denoise, batch processing, dan ekspor MP4.
-- Paket Linux/macOS/Windows dari GitHub adalah arsip preview, bukan installer. Lihat [Panduan Paket](PANDUAN-PAKET.md) untuk cara menjalankannya.
+- Paket GitHub menyediakan arsip portable dan installer preview untuk Windows/Linux/macOS. Lihat [Panduan Paket](PANDUAN-PAKET.md) untuk cara memasangnya.
 
 ## 2. Mulai sesi
 
@@ -40,8 +40,11 @@ Jika media sumber dipindah atau dihapus, track akan berstatus offline. Gunakan *
 
 1. Pilih nama/klip track atau tombol **Pilih** di lane.
 2. Di Inspector, ubah **Gain track**, **Pan**, **Mute**, atau **Solo**.
-3. Buka bagian **Restorasi** pada lane track untuk kontrol efek. Perubahan diterapkan ke playback dan ekspor tanpa mengubah file sumber.
-4. Gain otomasi ditambahkan pada waktu playhead. Tambah titik, atur nilai gain, dan ulangi untuk membentuk kurva. Titik mengikuti waktu timeline dengan interpolasi linear.
+3. Buka **Equalizer 6-band** di Inspector untuk membentuk tonalitas track. Seret titik pada kurva, atau pilih band lalu atur frekuensi, gain, dan Q dengan slider. Gunakan bypass untuk membandingkan sinyal asli.
+4. Buka bagian **Restorasi** pada lane track untuk kontrol efek. Perubahan diterapkan ke playback dan ekspor tanpa mengubah file sumber.
+5. Gain otomasi ditambahkan pada waktu playhead. Tambah titik, atur nilai gain, dan ulangi untuk membentuk kurva. Titik mengikuti waktu timeline dengan interpolasi linear.
+
+Jika track berasal dari video, Inspector menampilkan frame preview yang mengikuti playhead (diperbarui dua kali per detik saat digeser/diputar). FFmpeg harus tersedia di `PATH`; preview hanya untuk melihat gambar dan tidak mengubah video sumber.
 
 ### Kontrol restorasi
 
@@ -52,6 +55,7 @@ Jika media sumber dipindah atau dihapus, track akan berstatus offline. Gunakan *
 - **De-click / De-clip:** rekonstruksi transien klik dan clipping terisolasi. Hasilnya paling baik untuk kerusakan singkat.
 - **De-esser:** kendalikan energi sibilan berlebih.
 - **De-reverb:** tekan tail reverb yang pelan; setelan kuat dapat ikut menurunkan dialog pelan.
+- **Equalizer 6-band:** aktifkan band yang diinginkan. Seret titik pada kurva frekuensi logaritmik untuk mengubah frekuensi dan gain; slider memberi kontrol yang lebih presisi. Gain bergerak dari −18 hingga +18 dB, Q dari 0,25 (lebar) hingga 8 (sempit). Band dapat dipilih, dinonaktifkan, atau di-bypass bersama. Boost besar dapat membuat output mencapai clipping; kurangi gain track/master bila perlu.
 - **Kurangi bleed:** kurangi suara yang berkorelasi dengan track referensi. Pilih referensi yang tepat, atur reduksi/offset, lalu gunakan **Align otomatis** bila perlu. Bahan audio utama yang berkorelasi juga akan ikut berkurang.
 
 Gunakan bypass untuk membandingkan efek, dan dengarkan dengan headphone/speaker yang wajar sebelum mengekspor hasil penting. Pemrosesan restorasi bukan pengganti pemeriksaan telinga.
@@ -97,4 +101,4 @@ Normalisasi mengatur peak sample, bukan loudness terintegrasi LUFS. Periksa hasi
 
 ## 10. Batasan preview
 
-iZotay masih prototipe/preview. Aplikasi mengedit audio dari video, tetapi belum menampilkan gambar video. Perangkat output, latensi, pembaca layar, lisensi dependency, kualitas restorasi pada rekaman produksi, dan installer final perlu diuji sebelum penggunaan produksi.
+iZotay masih prototipe/preview. Preview video hanya still frame 640×360 hingga dua kali per detik, bukan monitor video real-time. Perangkat output, latensi, pembaca layar, lisensi dependency, kualitas restorasi pada rekaman produksi, serta penandatanganan/notarization macOS perlu diuji sebelum penggunaan produksi.

@@ -64,28 +64,112 @@ jobs:
         shell: pwsh
         run: |
           $bundleDir = Join-Path $env:RUNNER_TEMP "izotay"
+          $releaseDir = Join-Path $env:RUNNER_TEMP "release-assets"
           New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
           Copy-Item target/release/izotay.exe $bundleDir
           Copy-Item -Path PANDUAN-PAKET.md,PANDUAN-PENGGUNA.md -Destination $bundleDir
-          $archive = Join-Path $env:RUNNER_TEMP "izotay-$env:RUNNER_OS-$env:RUNNER_ARCH.zip"
+          $archive = Join-Path $releaseDir "izotay-$env:RUNNER_OS-$env:RUNNER_ARCH.zip"
           Compress-Archive -Path "$bundleDir\*" -DestinationPath $archive -CompressionLevel Optimal
-          "IZOTAY_PACKAGE=$archive" >> $env:GITHUB_ENV
+          choco install innosetup -y --no-progress
+          $iss = Join-Path $env:RUNNER_TEMP "izotay.iss"
+          @"
+          [Setup]
+          AppId={{28CA71CB-D7D0-4683-B813-5DE436E0522A}
+          AppName=iZotay
+          AppVersion=0.2.0
+          AppPublisher=iZotay contributors
+          DefaultDirName={autopf}\iZotay
+          DefaultGroupName=iZotay
+          OutputDir=$releaseDir
+          OutputBaseFilename=izotay-$env:RUNNER_OS-$env:RUNNER_ARCH-setup
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64
+          UninstallDisplayIcon={app}\izotay.exe
+          [Files]
+          Source: "$bundleDir\izotay.exe"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "$bundleDir\PANDUAN-PAKET.md"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "$bundleDir\PANDUAN-PENGGUNA.md"; DestDir: "{app}"; Flags: ignoreversion
+          [Icons]
+          Name: "{group}\iZotay"; Filename: "{app}\izotay.exe"
+          Name: "{autodesktop}\iZotay"; Filename: "{app}\izotay.exe"; Tasks: desktopicon
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
+          [Run]
+          Filename: "{app}\izotay.exe"; Description: "Launch iZotay"; Flags: postinstall nowait skipifsilent
+          "@ | Set-Content -Path $iss -Encoding UTF8
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" $iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
+          "IZOTAY_OUTPUT_DIR=$releaseDir" >> $env:GITHUB_ENV
 
       - name: Package Unix preview
         if: runner.os != 'Windows'
         run: |
           bundle_dir="$RUNNER_TEMP/izotay"
+          release_dir="$RUNNER_TEMP/release-assets"
           mkdir -p "$bundle_dir"
+          mkdir -p "$release_dir"
           cp target/release/izotay PANDUAN-PAKET.md PANDUAN-PENGGUNA.md "$bundle_dir/"
-          archive="$RUNNER_TEMP/izotay-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
+          archive="$release_dir/izotay-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
           tar -czf "$archive" -C "$RUNNER_TEMP" izotay
-          echo "IZOTAY_PACKAGE=$archive" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            package_root="$RUNNER_TEMP/deb-root"
+            mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin" "$package_root/usr/share/doc/izotay" "$package_root/usr/share/applications"
+            install -m 0755 target/release/izotay "$package_root/usr/bin/izotay"
+            install -m 0644 PANDUAN-PAKET.md PANDUAN-PENGGUNA.md "$package_root/usr/share/doc/izotay/"
+            cat > "$package_root/usr/share/applications/izotay.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=iZotay
+          Comment=Non-destructive dialogue audio editor
+          Exec=izotay
+          Icon=applications-multimedia
+          Terminal=false
+          Categories=AudioVideo;Audio;
+          DESKTOP
+            cat > "$package_root/DEBIAN/control" <<'CONTROL'
+          Package: izotay
+          Version: 0.2.0
+          Section: sound
+          Priority: optional
+          Architecture: amd64
+          Depends: libasound2 | libasound2t64, libgl1, libx11-6, libxkbcommon0, libwayland-client0
+          Recommends: ffmpeg
+          Maintainer: iZotay contributors
+          Description: Non-destructive multitrack audio restoration editor
+           Desktop editor for dialogue restoration and video audio editing.
+          CONTROL
+            dpkg-deb --build --root-owner-group "$package_root" "$release_dir/izotay-${RUNNER_OS}-${RUNNER_ARCH}.deb"
+          else
+            app_dir="$RUNNER_TEMP/Izotay.app/Contents"
+            mkdir -p "$app_dir/MacOS" "$app_dir/Resources"
+            install -m 0755 target/release/izotay "$app_dir/MacOS/izotay"
+            install -m 0644 PANDUAN-PAKET.md PANDUAN-PENGGUNA.md "$app_dir/Resources/"
+            cat > "$app_dir/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleName</key><string>iZotay</string>
+          <key>CFBundleDisplayName</key><string>iZotay</string>
+          <key>CFBundleIdentifier</key><string>org.izotay.editor</string>
+          <key>CFBundleExecutable</key><string>izotay</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleShortVersionString</key><string>0.2.0</string>
+          <key>CFBundleVersion</key><string>0.2.0</string>
+          <key>LSMinimumSystemVersion</key><string>12.0</string>
+          <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          PLIST
+            hdiutil create -volname iZotay -srcfolder "$RUNNER_TEMP/Izotay.app" -ov -format UDZO "$release_dir/izotay-${RUNNER_OS}-${RUNNER_ARCH}.dmg"
+          fi
+          echo "IZOTAY_OUTPUT_DIR=$release_dir" >> "$GITHUB_ENV"
 
       - name: Upload preview package
         uses: actions/upload-artifact@v4
         with:
           name: izotay-${{ runner.os }}-${{ runner.arch }}
-          path: ${{ env.IZOTAY_PACKAGE }}
+          path: ${{ env.IZOTAY_OUTPUT_DIR }}/*
           if-no-files-found: error
 
   publish-release:

@@ -7,9 +7,10 @@ iZotay adalah prototipe editor desktop lokal untuk dialog, podcast, wawancara, d
 
 ## Fitur yang tersedia
 
-- Impor beberapa WAV, format audio lain, atau video dengan audio sebagai track. Audio video dapat diedit dan diekspor ke MP4 baru; video sumber tidak diubah.
+- Impor beberapa WAV, format audio lain, atau video dengan audio sebagai track. Preview frame mengikuti playhead; audio video dapat diedit dan diekspor ke MP4 baru tanpa mengubah video sumber.
 - Timeline multi-track dengan zoom, waveform multi-resolusi, playhead, marker, seleksi waktu, loop preview, snap, split, trim, pindah/duplikasi klip, fade, crossfade, hapus, undo, dan redo.
 - Tampilan waveform atau spectrogram per track; spectrogram memakai 64 pita frekuensi dan cache ringkas untuk sumber panjang.
+- Equalizer parametrik 6-band per track dengan titik kurva yang dapat digeser, kontrol frekuensi 20 Hz–20 kHz, gain ±18 dB, Q 0,25–8, bypass, dan penyimpanan sesi/preset.
 - Restorasi per track: high-pass rumble, notch hum 50/60 Hz, expander, denoise FFmpeg `afftdn`, de-click, de-clip, de-esser, dan penekan tail reverb ringan. Kontrol menyediakan bypass, A/B, dan profil noise dari seleksi.
 - Otomasi gain per track dengan titik pada playhead, interpolasi linear, tampilan kurva di klip, undo/redo, dan penyimpanan sesi.
 - Bleed reduction per track memakai track referensi, reduksi 0–24 dB, offset manual ±500 ms, dan alignment otomatis berbasis korelasi hingga ±500 ms.
@@ -18,19 +19,18 @@ iZotay adalah prototipe editor desktop lokal untuk dialog, podcast, wawancara, d
 - Aksesibilitas menyediakan dukungan AccessKit untuk teknologi bantu, kontras tinggi, skala UI 80–160%, target kontrol yang lebih besar, serta shortcut yang tidak mengambil alih pengetikan di kolom teks.
 - Preview dapat dibatasi ke seleksi; ekspor menerapkan efek aktif ke seluruh rentang ekspor.
 - Playback, meter peak, ekspor mix atau track ke WAV PCM 16/24/32-bit, normalisasi peak, dan ekspor audio hasil edit ke MP4.
-- Sesi versi 17 dapat menyimpan pengaturan timeline, klip, marker, efek, profil noise, otomasi gain, referensi bleed, alignment, preferensi aksesibilitas, dan pengaturan ekspor. Sesi versi 1–16 tetap dibaca; fitur baru memakai nilai aman saat membuka sesi lama.
+- Sesi versi 18 dapat menyimpan pengaturan timeline, klip, marker, efek termasuk EQ, profil noise, otomasi gain, referensi bleed, alignment, preferensi aksesibilitas, dan pengaturan ekspor. Sesi versi 1–17 tetap dibaca; EQ pada sesi lama mulai dengan enam band datar dan bypass.
 - Sumber media, waveform, dan hasil DSP memakai cache file-backed. Pemrosesan full-track berjalan bertahap; cache sampel dibatasi sekitar 4 GiB secara best-effort.
 
 ## Batasan saat ini
 
-- Preview gambar video belum tersedia. Aplikasi mengedit audio dari video saja.
 - De-click/de-clip memakai rekonstruksi sampel terisolasi, de-esser memakai deteksi energi high-band, dan de-reverb menekan level tail yang pelan. Dengarkan hasilnya pada materi sasaran sebelum produksi.
 - Bleed reduction paling efektif bila referensi berisi sumber bleed yang sama dengan timing dekat. Periksa hasilnya karena komponen suara yang berkorelasi memang akan dikurangi dari track target.
 - Batch processing mengeluarkan WAV PCM 24-bit per sumber, menggunakan efek preset tanpa relasi track referensi atau profil noise berbasis seleksi. Konsolidasi menyalin media dan sesi; FFmpeg dan cache sementara tetap dikelola terpisah.
 - Preview efek untuk seleksi yang sangat panjang masih menyimpan hasil seleksi di memori.
 - Cache berada di direktori sementara dan dapat dibangun ulang; gunakan file sesi dan media sumber sebagai data proyek utama.
 - FFmpeg harus tersedia di `PATH` untuk format non-WAV, audio video, denoise, dan ekspor MP4.
-- Aplikasi masih prototipe/preview. CI menjalankan tes, Clippy, dan build release di Linux, Windows, dan macOS. Uji perangkat audio/latensi, rekaman dialog nyata, pembaca layar, lisensi dependency, serta packaging installer tetap perlu dilakukan sebelum rilis produksi.
+- Aplikasi masih prototipe/preview. Paket portable tersedia bersama installer Windows, paket `.deb` Linux, dan disk image macOS. Uji perangkat audio/latensi, rekaman dialog nyata, pembaca layar, lisensi dependency, dan penandatanganan/notarization macOS tetap perlu dilakukan sebelum rilis produksi.
 
 ## Persiapan dan menjalankan
 
@@ -57,7 +57,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-Workflow GitHub Actions menjalankan tes, Clippy, dan build release pada Linux, Windows, dan macOS. Workflow mengunggah bundle preview per sistem operasi (`.zip` untuk Windows, `.tar.gz` untuk Linux/macOS) beserta [panduan paket](PANDUAN-PAKET.md). Tag `v*` membuat GitHub Release preview dengan ketiga bundle. Paket belum berupa installer dan FFmpeg tetap menjadi dependensi terpisah. CI tidak menguji perangkat audio fisik, latensi playback, screen reader, ataupun kualitas restorasi pada rekaman produksi.
+Workflow GitHub Actions menjalankan tes, Clippy, build release, dan pembuatan paket pada Linux, Windows, serta macOS. Tag `v*` membuat GitHub Release preview dengan arsip portable dan paket instalasi tiap platform. FFmpeg tetap menjadi dependensi terpisah. CI tidak menguji perangkat audio fisik, latensi playback, screen reader, ataupun kualitas restorasi pada rekaman produksi.
 
 ## Arsitektur
 
