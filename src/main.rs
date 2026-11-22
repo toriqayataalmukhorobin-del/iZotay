@@ -5786,6 +5786,85 @@ mod tests {
     }
 
     #[test]
+    fn wav_import_filter_mix_export_roundtrip() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!("izotay-pipeline-{nonce}.wav"));
+        let output_path = std::env::temp_dir().join(format!("izotay-pipeline-{nonce}-out.wav"));
+        let mut writer = hound::WavWriter::create(
+            &source_path,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 48_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for frame in 0..8192 {
+            let value = ((frame as f32 * 0.041).sin() * 9000.0) as i16;
+            writer.write_sample(value).unwrap();
+            writer.write_sample(-value / 2).unwrap();
+        }
+        writer.finalize().unwrap();
+        let audio = read_wav(&source_path).unwrap();
+        let settings = TrackSettings {
+            name: "pipeline".into(),
+            path: source_path.display().to_string(),
+            gain: 1.0,
+            pan: 0.0,
+            mute: false,
+            solo: false,
+            rumble_cutoff_hz: 75.0,
+            rumble_bypass: false,
+            hum_frequency_hz: 50,
+            hum_bypass: false,
+            gate_threshold_db: -45.0,
+            gate_bypass: false,
+            denoise_reduction_db: 12.0,
+            denoise_bypass: true,
+            denoise_profile_range: None,
+            clips: vec![ClipSettings {
+                source_start: 0.0,
+                source_end: audio.samples.len() as f64
+                    / audio.channels as f64
+                    / audio.sample_rate as f64,
+                position: 0.0,
+                fade_in_seconds: 0.0,
+                fade_out_seconds: 0.0,
+                gain: 1.0,
+            }],
+        };
+        let source_cache = source_sample_cache_path(&source_path, 48_000, 2).unwrap();
+        let effects_cache = pre_effect_cache_path(&source_path, 48_000, 2, &settings).unwrap();
+        let track = Track {
+            settings,
+            audio,
+            waveform: Arc::new(WaveformCache::default()),
+            offline: false,
+        };
+        let mix = render_mix(std::slice::from_ref(&track)).unwrap();
+        assert_eq!(mix.playback.frames, 8192);
+        write_mix_wav_24(&mix.playback, &output_path).unwrap();
+        let output = read_wav(&output_path).unwrap();
+        let output_cache = source_sample_cache_path(&output_path, 48_000, 2).unwrap();
+        assert_eq!(output.sample_rate, 48_000);
+        assert_eq!(output.channels, 2);
+        assert_eq!(output.samples.len(), 8192 * 2);
+        assert!(output.samples.iter().any(|sample| sample.abs() > 0.01));
+        drop(output);
+        drop(mix);
+        drop(track);
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(output_path).unwrap();
+        std::fs::remove_file(source_cache).unwrap();
+        std::fs::remove_file(effects_cache).unwrap();
+        std::fs::remove_file(output_cache).unwrap();
+    }
+
+    #[test]
     fn ffmpeg_denoise_streams_to_file_backed_cache() {
         let Ok(filters) = std::process::Command::new("ffmpeg")
             .args(["-hide_banner", "-filters"])

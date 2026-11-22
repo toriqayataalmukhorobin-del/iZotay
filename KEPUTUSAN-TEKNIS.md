@@ -55,7 +55,7 @@ Status: implementasi Tahap 2 untuk pipeline media panjang selesai: sumber dan ha
 - Batas loop belum memakai crossfade; pilih rentang dengan transisi yang bersih untuk menghindari klik.
 - Relink memangkas klip yang sumbernya melebihi durasi berkas yang dipilih; kecocokan identitas media belum diverifikasi otomatis.
 - Penggantian file sesi memakai file sementara dan cadangan agar dapat berjalan pada sistem yang tidak mendukung rename langsung di atas file yang ada.
-- `cargo test` (20 test), `cargo check`, build debug, Clippy dengan warning sebagai error, dan `git diff --check` bersih. Tes mencakup WAV PCM 16/24/32-bit dan float, impor FFmpeg non-WAV, seluruh sample rate/bit depth ekspor, resampling, roundtrip sesi, preview/profil noise, pruning cache, kesetaraan DSP bertahap, serta FFmpeg denoise bila tersedia. Uji alur UI pada rekaman dialog nyata dan validasi lintas Windows/macOS masih diperlukan.
+- `cargo test` (21 test), `cargo check`, build debug, Clippy dengan warning sebagai error, dan `git diff --check` bersih. Tes mencakup WAV PCM 16/24/32-bit dan float, impor FFmpeg non-WAV, alur WAV impor-filter-mix-ekspor-impor, seluruh sample rate/bit depth ekspor, resampling, roundtrip sesi, preview/profil noise, pruning cache, kesetaraan DSP bertahap, serta FFmpeg denoise bila tersedia. Uji alur UI pada rekaman dialog nyata dan hasil CI Windows/macOS masih perlu ditinjau.
 
 ## Validasi sebelum rilis
 
