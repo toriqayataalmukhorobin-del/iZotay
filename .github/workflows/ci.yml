@@ -59,18 +59,31 @@ jobs:
       - name: Build release binary
         run: cargo +stable build --release
 
-      - name: Upload Windows binary
+      - name: Package Windows preview
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: izotay-${{ runner.os }}-${{ runner.arch }}
-          path: target/release/izotay.exe
-          if-no-files-found: error
+        shell: pwsh
+        run: |
+          $bundleDir = Join-Path $env:RUNNER_TEMP "izotay"
+          New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
+          Copy-Item target/release/izotay.exe $bundleDir
+          Copy-Item PANDUAN-PAKET.md $bundleDir
+          $archive = Join-Path $env:RUNNER_TEMP "izotay-$env:RUNNER_OS-$env:RUNNER_ARCH.zip"
+          Compress-Archive -Path "$bundleDir\*" -DestinationPath $archive -CompressionLevel Optimal
+          "IZOTAY_PACKAGE=$archive" >> $env:GITHUB_ENV
 
-      - name: Upload Unix binary
+      - name: Package Unix preview
         if: runner.os != 'Windows'
+        run: |
+          bundle_dir="$RUNNER_TEMP/izotay"
+          mkdir -p "$bundle_dir"
+          cp target/release/izotay PANDUAN-PAKET.md "$bundle_dir/"
+          archive="$RUNNER_TEMP/izotay-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
+          tar -czf "$archive" -C "$RUNNER_TEMP" izotay
+          echo "IZOTAY_PACKAGE=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload preview package
         uses: actions/upload-artifact@v4
         with:
           name: izotay-${{ runner.os }}-${{ runner.arch }}
-          path: target/release/izotay
+          path: ${{ env.IZOTAY_PACKAGE }}
           if-no-files-found: error

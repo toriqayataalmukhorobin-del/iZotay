@@ -54,7 +54,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-Workflow GitHub Actions menjalankan tes, Clippy, dan build release pada Linux, Windows, dan macOS. Ketiga job CI terakhir lulus. Workflow mengunggah binary per sistem operasi sebagai artifact; artifact tersebut belum berupa installer dan FFmpeg tetap menjadi dependensi terpisah. CI tidak menguji perangkat audio fisik, latensi playback, screen reader, ataupun kualitas restorasi pada rekaman produksi.
+Workflow GitHub Actions menjalankan tes, Clippy, dan build release pada Linux, Windows, dan macOS. Workflow mengunggah bundle preview per sistem operasi (`.zip` untuk Windows, `.tar.gz` untuk Linux/macOS) beserta [panduan paket](PANDUAN-PAKET.md). Bundle belum berupa installer dan FFmpeg tetap menjadi dependensi terpisah. CI tidak menguji perangkat audio fisik, latensi playback, screen reader, ataupun kualitas restorasi pada rekaman produksi.
 
 ## Arsitektur
 
