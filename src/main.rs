@@ -7669,14 +7669,17 @@ mod tests {
         std::fs::write(&old, [0u8; 8]).unwrap();
         std::fs::write(&recent, [0u8; 8]).unwrap();
         std::fs::write(&orphaned, [0u8; 8]).unwrap();
-        let old_file = std::fs::File::open(&old).unwrap();
+        let old_file = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
         old_file
             .set_times(
                 std::fs::FileTimes::new()
                     .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
             )
             .unwrap();
-        let orphaned_file = std::fs::File::open(&orphaned).unwrap();
+        let orphaned_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphaned)
+            .unwrap();
         orphaned_file
             .set_times(std::fs::FileTimes::new().set_modified(
                 std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60),
