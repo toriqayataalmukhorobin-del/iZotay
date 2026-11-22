@@ -5989,7 +5989,7 @@ fn draw_equalizer(
                 .checkbox(&mut band.enabled, format!("Band {}", *selected_band + 1))
                 .changed();
         });
-        let max_frequency = (sample_rate as f32 * 0.49).min(20_000.0).max(20.0);
+        let max_frequency = (sample_rate as f32 * 0.49).clamp(20.0, 20_000.0);
         changed |= ui
             .add(
                 egui::Slider::new(&mut band.frequency_hz, 20.0..=max_frequency)
@@ -6108,10 +6108,9 @@ fn process_stage3_effects(
             }
         }
         for (filter_index, filter) in eq_filters.iter().enumerate() {
-            for channel in 0..channels {
+            for (channel, state) in eq_state[filter_index].iter_mut().enumerate() {
                 let index = start + channel;
                 let input = output[index];
-                let state = &mut eq_state[filter_index][channel];
                 let result = filter.b0 * input + state[0];
                 state[0] = filter.b1 * input - filter.a1 * result + state[1];
                 state[1] = filter.b2 * input - filter.a2 * result;
