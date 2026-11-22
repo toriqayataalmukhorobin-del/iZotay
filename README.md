@@ -1,4 +1,4 @@
-# iZotay — Editor Restorasi Audio Multi-track
+# iZotay — Editor Restorasi Audio Multi-Track Mini Equalizer
 
 iZotay adalah prototipe editor desktop lokal untuk dialog, podcast, wawancara, dan voice-over. Sumber media tidak ditimpa; edit klip dan parameter restorasi disimpan sebagai instruksi di sesi `.izotay`.
 
