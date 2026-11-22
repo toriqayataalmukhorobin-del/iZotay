@@ -40,11 +40,11 @@ Jika media sumber dipindah atau dihapus, track akan berstatus offline. Gunakan *
 
 1. Pilih nama/klip track atau tombol **Pilih** di lane.
 2. Di Inspector, ubah **Gain track**, **Pan**, **Mute**, atau **Solo**.
-3. Buka **Equalizer 6-band** di Inspector untuk membentuk tonalitas track. Seret titik pada kurva, atau pilih band lalu atur frekuensi, gain, dan Q dengan slider. Gunakan bypass untuk membandingkan sinyal asli.
+3. **Equalizer 6-band** selalu terbuka di Inspector track. Pilih **Dialog jelas** atau **Hangat** sebagai titik awal, lalu dengarkan hasilnya. Seret titik pada kurva atau pilih band dan atur frekuensi, gain, serta Q lewat slider. Kurva awal rata; preset bukan aturan universal, jadi sesuaikan dengan suara rekaman.
 4. Buka bagian **Restorasi** pada lane track untuk kontrol efek. Perubahan diterapkan ke playback dan ekspor tanpa mengubah file sumber.
 5. Gain otomasi ditambahkan pada waktu playhead. Tambah titik, atur nilai gain, dan ulangi untuk membentuk kurva. Titik mengikuti waktu timeline dengan interpolasi linear.
 
-Jika track berasal dari video, Inspector menampilkan frame preview yang mengikuti playhead (diperbarui dua kali per detik saat digeser/diputar). FFmpeg harus tersedia di `PATH`; preview hanya untuk melihat gambar dan tidak mengubah video sumber.
+Jika track berasal dari video, Inspector menampilkan frame preview saat playhead berhenti. Preview dijeda selama playback untuk menjaga respons editor; FFmpeg harus tersedia di `PATH`. Preview hanya untuk melihat gambar dan tidak mengubah video sumber.
 
 ### Kontrol restorasi
 
@@ -101,4 +101,4 @@ Normalisasi mengatur peak sample, bukan loudness terintegrasi LUFS. Periksa hasi
 
 ## 10. Batasan preview
 
-iZotay masih prototipe/preview. Preview video hanya still frame 640×360 hingga dua kali per detik, bukan monitor video real-time. Perangkat output, latensi, pembaca layar, lisensi dependency, kualitas restorasi pada rekaman produksi, serta penandatanganan/notarization macOS perlu diuji sebelum penggunaan produksi.
+iZotay masih prototipe/preview. Preview video hanya still frame 480×270 saat playhead berhenti, bukan monitor video real-time. Perangkat output, latensi, pembaca layar, lisensi dependency, kualitas restorasi pada rekaman produksi, serta penandatanganan/notarization macOS perlu diuji sebelum penggunaan produksi.

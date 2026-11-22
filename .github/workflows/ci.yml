@@ -77,7 +77,7 @@ jobs:
           [Setup]
           AppId={{28CA71CB-D7D0-4683-B813-5DE436E0522A}
           AppName=iZotay
-          AppVersion=0.2.0
+          AppVersion=0.2.1
           AppPublisher=iZotay contributors
           DefaultDirName={autopf}\iZotay
           DefaultGroupName=iZotay
@@ -130,7 +130,7 @@ jobs:
           DESKTOP
             cat > "$package_root/DEBIAN/control" <<'CONTROL'
           Package: izotay
-          Version: 0.2.0
+          Version: 0.2.1
           Section: sound
           Priority: optional
           Architecture: amd64
@@ -155,8 +155,8 @@ jobs:
           <key>CFBundleIdentifier</key><string>org.izotay.editor</string>
           <key>CFBundleExecutable</key><string>izotay</string>
           <key>CFBundlePackageType</key><string>APPL</string>
-          <key>CFBundleShortVersionString</key><string>0.2.0</string>
-          <key>CFBundleVersion</key><string>0.2.0</string>
+          <key>CFBundleShortVersionString</key><string>0.2.1</string>
+          <key>CFBundleVersion</key><string>0.2.1</string>
           <key>LSMinimumSystemVersion</key><string>12.0</string>
           <key>NSHighResolutionCapable</key><true/>
           </dict></plist>

@@ -561,7 +561,7 @@ fn eq_bands_valid(bands: &[EqBand]) -> bool {
 }
 
 fn default_eq_bypass() -> bool {
-    true
+    false
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1379,6 +1379,7 @@ struct App {
     mix_worker: MixWorker,
     mix_generation: u64,
     mix_pending: bool,
+    mix_rebuild_debounce_until: Option<std::time::Instant>,
     export_result: Option<Receiver<ExportMessage>>,
     export_in_progress: bool,
     export_cancel: Option<Arc<AtomicBool>>,
@@ -1402,8 +1403,11 @@ struct App {
     video_preview_result: Option<Receiver<VideoPreviewResult>>,
     video_preview_cancel: Option<Arc<AtomicBool>>,
     video_preview_key: Option<(u64, i64, String)>,
+    video_preview_candidate_key: Option<(u64, i64, String)>,
+    video_preview_debounce_until: Option<std::time::Instant>,
     video_preview_texture: Option<egui::TextureHandle>,
     video_preview_texture_key: Option<(u64, String)>,
+    video_preview_frames: Vec<((u64, i64, String), Vec<u8>)>,
     video_preview_message: Option<String>,
 }
 struct VideoPreviewResult {
@@ -1453,6 +1457,7 @@ impl Default for App {
             mix_worker: MixWorker::new(),
             mix_generation: 0,
             mix_pending: false,
+            mix_rebuild_debounce_until: None,
             export_result: None,
             export_in_progress: false,
             export_cancel: None,
@@ -1476,8 +1481,11 @@ impl Default for App {
             video_preview_result: None,
             video_preview_cancel: None,
             video_preview_key: None,
+            video_preview_candidate_key: None,
+            video_preview_debounce_until: None,
             video_preview_texture: None,
             video_preview_texture_key: None,
+            video_preview_frames: Vec::new(),
             video_preview_message: None,
         }
     }
@@ -1492,7 +1500,12 @@ impl App {
                     if self.video_preview_key.as_ref() == Some(&message.key) {
                         match message.result {
                             Ok(pixels) => {
-                                let image = egui::ColorImage::from_rgb([640, 360], &pixels);
+                                if self.video_preview_frames.len() >= 24 {
+                                    self.video_preview_frames.remove(0);
+                                }
+                                self.video_preview_frames
+                                    .push((message.key.clone(), pixels.clone()));
+                                let image = egui::ColorImage::from_rgb([480, 270], &pixels);
                                 self.video_preview_texture_key =
                                     Some((message.key.0, message.key.2.clone()));
                                 if let Some(texture) = &mut self.video_preview_texture {
@@ -1523,6 +1536,21 @@ impl App {
             }
         }
 
+        let is_playing = self
+            .player
+            .as_ref()
+            .is_some_and(|player| player.playing.load(Ordering::Relaxed));
+        if is_playing {
+            if let Some(cancel) = self.video_preview_cancel.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.video_preview_result = None;
+            self.video_preview_key = None;
+            self.video_preview_candidate_key = None;
+            self.video_preview_debounce_until = None;
+            return;
+        }
+
         let candidate = self.selected_track.and_then(|index| {
             let track = self.tracks.get(index)?;
             if track.offline || !is_video_file(std::path::Path::new(&track.settings.path)) {
@@ -1547,11 +1575,55 @@ impl App {
             }
             self.video_preview_result = None;
             self.video_preview_key = None;
+            self.video_preview_candidate_key = None;
+            self.video_preview_debounce_until = None;
             self.video_preview_message = None;
             return;
         };
         let key = (track_id, bucket, path.clone());
         if self.video_preview_key.as_ref() == Some(&key) {
+            return;
+        }
+        if self.video_preview_candidate_key.as_ref() != Some(&key) {
+            if let Some(cancel) = self.video_preview_cancel.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.video_preview_result = None;
+            self.video_preview_key = None;
+            self.video_preview_candidate_key = Some(key.clone());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            self.video_preview_debounce_until = Some(deadline);
+            self.video_preview_message =
+                Some("Preview diperbarui setelah playhead berhenti…".into());
+            ctx.request_repaint_after(std::time::Duration::from_millis(310));
+            return;
+        }
+        if let Some(deadline) = self.video_preview_debounce_until {
+            let now = std::time::Instant::now();
+            if now < deadline {
+                ctx.request_repaint_after(deadline.saturating_duration_since(now));
+                return;
+            }
+        }
+        if let Some((_, pixels)) = self
+            .video_preview_frames
+            .iter()
+            .find(|(cached_key, _)| cached_key == &key)
+        {
+            let image = egui::ColorImage::from_rgb([480, 270], pixels);
+            if let Some(texture) = &mut self.video_preview_texture {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.video_preview_texture = Some(ctx.load_texture(
+                    "izotay-video-preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            self.video_preview_texture_key = Some((track_id, path));
+            self.video_preview_message = None;
+            self.video_preview_key = Some(key);
+            self.video_preview_debounce_until = None;
             return;
         }
         if let Some(cancel) = self.video_preview_cancel.take() {
@@ -1571,6 +1643,10 @@ impl App {
                             "-loglevel",
                             "error",
                             "-nostdin",
+                            "-threads",
+                            "1",
+                            "-filter_threads",
+                            "1",
                             "-ss",
                         ])
                         .arg(format!("{source_time:.3}"))
@@ -1583,7 +1659,7 @@ impl App {
                             "-frames:v",
                             "1",
                             "-vf",
-                            "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2",
+                            "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2",
                             "-pix_fmt",
                             "rgb24",
                             "-f",
@@ -1606,7 +1682,7 @@ impl App {
                         .ok_or_else(|| "Output preview video tidak tersedia".to_owned())?;
                     let reader = std::thread::spawn(move || {
                         use std::io::Read;
-                        let mut pixels = vec![0_u8; 640 * 360 * 3];
+                        let mut pixels = vec![0_u8; 480 * 270 * 3];
                         stdout.read_exact(&mut pixels).map(|()| pixels)
                     });
                     loop {
@@ -1647,6 +1723,7 @@ impl App {
             })
             .expect("gagal membuat worker preview video");
         self.video_preview_key = Some(key);
+        self.video_preview_debounce_until = None;
         self.video_preview_result = Some(receiver);
         self.video_preview_cancel = Some(cancelled);
         self.video_preview_message = Some("Memuat frame video…".into());
@@ -1973,6 +2050,7 @@ impl App {
         }
     }
     fn rebuild_mix(&mut self) {
+        self.mix_rebuild_debounce_until = None;
         self.mix_generation = self.mix_generation.wrapping_add(1);
         if self
             .effect_a
@@ -3399,6 +3477,14 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_video_preview(ctx);
         self.poll_mix();
+        if let Some(deadline) = self.mix_rebuild_debounce_until {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                self.rebuild_mix();
+            } else {
+                ctx.request_repaint_after(deadline.saturating_duration_since(now));
+            }
+        }
         self.poll_export();
         self.poll_import();
         self.poll_relink();
@@ -3931,6 +4017,7 @@ impl eframe::App for App {
             .default_width(316.0)
             .width_range(270.0..=430.0)
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Inspector");
                 ui.label("Pengaturan klip dan track terpilih");
                 ui.separator();
@@ -3962,11 +4049,12 @@ impl eframe::App for App {
                             egui::Align2::CENTER_CENTER,
                             self.video_preview_message
                                 .as_deref()
-                                .unwrap_or("Frame video muncul saat playhead berada di klip"),
+                                .unwrap_or("Jeda atau pindahkan playhead untuk melihat frame"),
                             egui::FontId::proportional(12.0),
                             ui.visuals().weak_text_color(),
                         );
                     }
+                    ui.weak("Preview dijeda saat playback agar editor tetap responsif.");
                     ui.separator();
                 }
                 if let Some((track_index, clip_index)) = self.selected_clip {
@@ -4035,15 +4123,15 @@ impl eframe::App for App {
                             inspector_changed |=
                                 ui.checkbox(&mut track.settings.solo, "Solo").changed();
                         });
-                        ui.collapsing("Equalizer 6-band", |ui| {
-                            inspector_changed |= draw_equalizer(
-                                ui,
-                                &mut track.settings.eq_bands,
-                                &mut track.settings.eq_bypass,
-                                &mut self.selected_eq_band,
-                                track.audio.sample_rate,
-                            );
-                        });
+                        ui.separator();
+                        ui.heading("Equalizer · 6 band");
+                        inspector_changed |= draw_equalizer(
+                            ui,
+                            &mut track.settings.eq_bands,
+                            &mut track.settings.eq_bypass,
+                            &mut self.selected_eq_band,
+                            track.audio.sample_rate,
+                        );
                         ui.collapsing("Otomasi gain", |ui| {
                             ui.add(
                                 egui::Slider::new(&mut self.automation_gain_value, 0.0..=4.0)
@@ -4108,6 +4196,7 @@ impl eframe::App for App {
                 } else {
                     ui.weak("Pilih track untuk mengatur level, pan, restorasi, dan otomasi.");
                 }
+                });
             });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -4976,9 +5065,27 @@ impl eframe::App for App {
                 self.relink_track(index);
             }
             if inspector_changed {
+                let eq_changed = self.selected_track.is_some_and(|index| {
+                    inspector_before
+                        .tracks
+                        .get(index)
+                        .zip(self.tracks.get(index))
+                        .is_some_and(|(before, after)| {
+                            before.settings.eq_bands != after.settings.eq_bands
+                                || before.settings.eq_bypass != after.settings.eq_bypass
+                        })
+                });
                 self.push_snapshot(inspector_before);
                 self.last_edit = Some(std::time::Instant::now());
-                self.rebuild_mix();
+                if eq_changed {
+                    self.mix_rebuild_debounce_until = Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(180),
+                    );
+                    self.status = Some("Menerapkan perubahan equalizer…".into());
+                    ctx.request_repaint_after(std::time::Duration::from_millis(190));
+                } else {
+                    self.rebuild_mix();
+                }
             }
             if checkpoint_drag {
                 self.push_snapshot(settings_before.clone());
@@ -5874,7 +5981,39 @@ fn draw_equalizer(
         *bands = default_eq_bands();
     }
     bands.truncate(12);
-    let mut changed = ui.checkbox(bypass, "Bypass equalizer").changed();
+    let mut changed = false;
+    let mut active = !*bypass;
+    if ui.checkbox(&mut active, "Equalizer aktif").changed() {
+        *bypass = !active;
+        changed = true;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.weak("Mulai dari:");
+        if ui.button("Rata").clicked() {
+            for band in bands.iter_mut() {
+                band.gain_db = 0.0;
+                band.enabled = true;
+            }
+            *bypass = false;
+            changed = true;
+        }
+        if ui.button("Dialog jelas").clicked() {
+            for (band, gain) in bands.iter_mut().zip([-3.0, -2.0, -2.0, 1.5, 3.0, 1.5]) {
+                band.gain_db = gain;
+                band.enabled = true;
+            }
+            *bypass = false;
+            changed = true;
+        }
+        if ui.button("Hangat").clicked() {
+            for (band, gain) in bands.iter_mut().zip([-2.0, 2.5, 1.5, 0.0, -1.0, -2.0]) {
+                band.gain_db = gain;
+                band.enabled = true;
+            }
+            *bypass = false;
+            changed = true;
+        }
+    });
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width().max(220.0), 176.0),
         egui::Sense::hover(),
@@ -5983,12 +6122,21 @@ fn draw_equalizer(
             egui::Stroke::new(1.0_f32, background),
         );
     }
-    if let Some(band) = bands.get_mut(*selected_band) {
-        ui.horizontal(|ui| {
-            changed |= ui
-                .checkbox(&mut band.enabled, format!("Band {}", *selected_band + 1))
-                .changed();
+    if !bands.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for (index, band) in bands.iter().enumerate() {
+                let name = if band.frequency_hz >= 1_000.0 {
+                    format!("{:.1}k", band.frequency_hz / 1_000.0)
+                } else {
+                    format!("{:.0}", band.frequency_hz)
+                };
+                if ui.selectable_label(index == *selected_band, name).clicked() {
+                    *selected_band = index;
+                }
+            }
         });
+        let band = &mut bands[*selected_band];
+        changed |= ui.checkbox(&mut band.enabled, "Band aktif").changed();
         let max_frequency = (sample_rate as f32 * 0.49).clamp(20.0, 20_000.0);
         changed |= ui
             .add(
@@ -6008,9 +6156,7 @@ fn draw_equalizer(
             )
             .changed();
     }
-    ui.weak(
-        "Seret titik untuk mengatur frekuensi dan gain. Perubahan terdengar di preview dan ekspor.",
-    );
+    ui.weak("Pilih band lalu atur frekuensi, gain, dan Q; titik kurva juga bisa diseret.");
     changed
 }
 

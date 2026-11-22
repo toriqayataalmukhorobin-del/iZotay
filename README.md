@@ -19,7 +19,7 @@ iZotay adalah prototipe editor desktop lokal untuk dialog, podcast, wawancara, d
 - Aksesibilitas menyediakan dukungan AccessKit untuk teknologi bantu, kontras tinggi, skala UI 80–160%, target kontrol yang lebih besar, serta shortcut yang tidak mengambil alih pengetikan di kolom teks.
 - Preview dapat dibatasi ke seleksi; ekspor menerapkan efek aktif ke seluruh rentang ekspor.
 - Playback, meter peak, ekspor mix atau track ke WAV PCM 16/24/32-bit, normalisasi peak, dan ekspor audio hasil edit ke MP4.
-- Sesi versi 18 dapat menyimpan pengaturan timeline, klip, marker, efek termasuk EQ, profil noise, otomasi gain, referensi bleed, alignment, preferensi aksesibilitas, dan pengaturan ekspor. Sesi versi 1–17 tetap dibaca; EQ pada sesi lama mulai dengan enam band datar dan bypass.
+- Sesi versi 18 dapat menyimpan pengaturan timeline, klip, marker, efek termasuk EQ, profil noise, otomasi gain, referensi bleed, alignment, preferensi aksesibilitas, dan pengaturan ekspor. Sesi versi 1–17 tetap dibaca; EQ pada sesi lama mulai datar agar suaranya tidak berubah.
 - Sumber media, waveform, dan hasil DSP memakai cache file-backed. Pemrosesan full-track berjalan bertahap; cache sampel dibatasi sekitar 4 GiB secara best-effort.
 
 ## Batasan saat ini

@@ -1,20 +1,16 @@
-# iZotay v0.2.0 — Preview
+# iZotay v0.2.1 — Preview
 
-Rilis preview iZotay dengan equalizer parametrik per track, preview frame video di Inspector, dan paket pemasangan untuk tiga platform.
+Perbaikan respons editor setelah umpan balik penggunaan iZotay v0.2.0.
 
 ## Perubahan
 
-- Equalizer 6-band dapat diatur lewat kurva drag atau slider frekuensi, gain, dan Q. Pengaturan EQ ikut ke playback, ekspor, undo, perbandingan A/B, sesi, preset, dan cache efek.
-- Inspector menampilkan still frame video yang mengikuti playhead; FFmpeg mengekstrak frame di latar belakang. Audio video tetap dapat diedit dan diekspor ke MP4 baru tanpa mengubah sumber.
-- Format sesi versi 18 menyimpan EQ dan tetap membuka sesi versi 1–17 dengan nilai default aman.
-- GitHub Actions menghasilkan paket portable dan paket pemasangan Windows Setup, Linux `.deb`, serta macOS `.dmg`.
-- [Panduan Pengguna](PANDUAN-PENGGUNA.md), [Panduan Paket](PANDUAN-PAKET.md), dan [README](README.md) telah diperbarui.
+- Preview video hanya memuat frame setelah playhead berhenti 300 ms. Render frame dijeda selama playback, memakai resolusi 480×270 dan menyimpan frame yang baru dikunjungi agar scrubbing tidak memicu proses FFmpeg berulang.
+- Equalizer 6-band kini selalu terlihat di Inspector. Equalizer mulai aktif dengan kurva datar, menyediakan preset **Dialog jelas** dan **Hangat**, serta tetap mendukung drag dan slider per band.
+- Render mix EQ menunggu 180 ms setelah perubahan terakhir saat slider digeser agar cache track tidak dibuat ulang berkali-kali.
+- Panduan penggunaan dan batasan preview telah diperbarui.
 
-## Sebelum mencoba
+## Catatan
 
-- Pasang FFmpeg secara terpisah untuk format non-WAV, preview dan audio video, denoise, batch, dan ekspor MP4.
-- macOS build preview belum ditandatangani atau notarized. Sistem mungkin meminta izin saat pertama kali dibuka.
-- Tetap simpan edit dalam sesi dan ekspor sebagai berkas baru; media sumber tidak ditimpa.
-- Uji perangkat audio/latensi, pembaca layar, lisensi dependency, dan hasil restorasi pada materi produksi masih diperlukan.
-
-Lihat [README](README.md) untuk fitur dan batasan lengkap.
+- FFmpeg tetap dibutuhkan untuk preview gambar dan fitur media non-WAV/video.
+- Preview video masih berupa still frame, bukan monitor real-time. macOS preview belum ditandatangani atau notarized.
+- Hasil EQ bergantung pada sumber; dengarkan dengan A/B dan sesuaikan preset sebelum ekspor.
