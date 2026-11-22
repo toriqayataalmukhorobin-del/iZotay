@@ -1,6 +1,6 @@
 # Editor Multi-track — Keputusan Teknis
 
-Status: implementasi Tahap 5 selesai: preset restorasi portabel, batch processing, konsolidasi aset, serta pilihan aksesibilitas tersedia. Sesi versi 17 tetap membaca versi 1–16 dengan default aman. Tahap 3–5 tersedia di aplikasi; pengujian alur UI pada rekaman dialog nyata serta Windows/macOS masih diperlukan sebelum rilis.
+Status: implementasi Tahap 5 selesai: preset restorasi portabel, batch processing, konsolidasi aset, serta pilihan aksesibilitas tersedia. Sesi versi 17 tetap membaca versi 1–16 dengan default aman. Tes, Clippy, dan build release lulus pada job CI Linux, Windows, dan macOS. Sebelum rilis masih diperlukan uji manual perangkat audio/latensi pada Windows dan macOS, rekaman dialog nyata, pembaca layar, pemeriksaan lisensi dependency, serta packaging installer.
 
 ## Pilihan prototipe
 
@@ -70,7 +70,7 @@ Status: implementasi Tahap 5 selesai: preset restorasi portabel, batch processin
 - Batas loop belum memakai crossfade; pilih rentang dengan transisi yang bersih untuk menghindari klik.
 - Relink memangkas klip yang sumbernya melebihi durasi berkas yang dipilih; kecocokan identitas media belum diverifikasi otomatis.
 - Penggantian file sesi memakai file sementara dan cadangan agar dapat berjalan pada sistem yang tidak mendukung rename langsung di atas file yang ada.
-- Tes lokal mencakup WAV PCM 16/24/32-bit dan float, impor FFmpeg non-WAV, alur WAV impor-filter-mix-ekspor-impor, seluruh sample rate/bit depth ekspor, resampling, roundtrip/migrasi sesi, preview/profil noise, pruning cache, kesetaraan DSP bertahap, spectrogram, restorasi Tahap 3/4, preset dengan field sesi yang dibuang dan validasi rentang, nama output batch tanpa overwrite, konsolidasi path relatif/deduplikasi media, alignment otomatis, pengurangan bleed referensi saat render, dan FFmpeg denoise bila tersedia. Uji alur UI pada rekaman dialog nyata dan hasil CI Windows/macOS masih perlu ditinjau.
+- Tes otomatis mencakup WAV PCM 16/24/32-bit dan float, impor FFmpeg non-WAV, alur WAV impor-filter-mix-ekspor-impor, seluruh sample rate/bit depth ekspor, resampling, roundtrip/migrasi sesi, preview/profil noise, pruning cache, kesetaraan DSP bertahap, spectrogram, restorasi Tahap 3/4, preset dengan field sesi yang dibuang dan validasi rentang, nama output batch tanpa overwrite, konsolidasi path relatif/deduplikasi media, alignment otomatis, pengurangan bleed referensi saat render, dan FFmpeg denoise bila tersedia. Job CI terakhir untuk Linux, Windows, dan macOS lulus. Uji alur UI pada rekaman dialog nyata belum dilakukan.
 
 ## Validasi sebelum rilis
 

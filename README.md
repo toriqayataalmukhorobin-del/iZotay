@@ -27,7 +27,7 @@ iZotay adalah prototipe editor desktop lokal untuk dialog, podcast, wawancara, d
 - Preview efek untuk seleksi yang sangat panjang masih menyimpan hasil seleksi di memori.
 - Cache berada di direktori sementara dan dapat dibangun ulang; gunakan file sesi dan media sumber sebagai data proyek utama.
 - FFmpeg harus tersedia di `PATH` untuk format non-WAV, audio video, denoise, dan ekspor MP4.
-- Aplikasi masih prototipe. Uji UI pada rekaman dialog nyata dan validasi latensi serta packaging di Windows/macOS masih diperlukan.
+- Aplikasi masih prototipe. CI sudah menjalankan tes, Clippy, dan build release di Linux, Windows, dan macOS. Uji perangkat audio/latensi, rekaman dialog nyata, pembaca layar, lisensi dependency, serta packaging installer tetap perlu dilakukan sebelum rilis.
 
 ## Persiapan dan menjalankan
 
@@ -54,7 +54,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-Workflow GitHub Actions menjalankan tes, Clippy, dan build release pada Linux, Windows, dan macOS. Workflow mengunggah binary per sistem operasi sebagai artifact; artifact tersebut belum berupa installer dan FFmpeg tetap menjadi dependensi terpisah.
+Workflow GitHub Actions menjalankan tes, Clippy, dan build release pada Linux, Windows, dan macOS. Ketiga job CI terakhir lulus. Workflow mengunggah binary per sistem operasi sebagai artifact; artifact tersebut belum berupa installer dan FFmpeg tetap menjadi dependensi terpisah. CI tidak menguji perangkat audio fisik, latensi playback, screen reader, ataupun kualitas restorasi pada rekaman produksi.
 
 ## Arsitektur
 
