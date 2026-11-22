@@ -3671,14 +3671,12 @@ impl eframe::App for App {
                 ui.add_space(2.0);
                 ui.weak("Space putar/jeda    S split    Ctrl/Cmd+Z undo    Ctrl/Cmd+D duplikasi");
             });
-        if transport_play_clicked {
-            if let (Some(player), Some(mix)) = (&self.player, &self.mix) {
-                let is_playing = player.playing.load(Ordering::Relaxed);
-                if !is_playing && player.cursor.load(Ordering::Relaxed) >= mix.frames {
-                    player.seek(0);
-                }
-                player.playing.store(!is_playing, Ordering::Relaxed);
+        if transport_play_clicked && let (Some(player), Some(mix)) = (&self.player, &self.mix) {
+            let is_playing = player.playing.load(Ordering::Relaxed);
+            if !is_playing && player.cursor.load(Ordering::Relaxed) >= mix.frames {
+                player.seek(0);
             }
+            player.playing.store(!is_playing, Ordering::Relaxed);
         }
         if transport_stop_clicked {
             if let Some(player) = &self.player {
@@ -3696,35 +3694,35 @@ impl eframe::App for App {
                 ui.label("Pengaturan klip dan track terpilih");
                 ui.separator();
                 if let Some((track_index, clip_index)) = self.selected_clip {
-                    if let Some(track) = self.tracks.get_mut(track_index) {
-                        if let Some(clip) = track.settings.clips.get_mut(clip_index) {
-                            let track_name = track.settings.name.clone();
-                            ui.strong("Klip terpilih");
-                            ui.weak(format!(
-                                "{} · {:.2} s",
-                                track_name,
-                                clip.source_end - clip.source_start
-                            ));
-                            inspector_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.gain, 0.0..=4.0)
-                                        .text("Gain klip ×"),
-                                )
-                                .changed();
-                            let max_fade = (clip.source_end - clip.source_start).min(2.0);
-                            inspector_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.fade_in_seconds, 0.0..=max_fade)
-                                        .text("Fade in"),
-                                )
-                                .changed();
-                            inspector_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.fade_out_seconds, 0.0..=max_fade)
-                                        .text("Fade out"),
-                                )
-                                .changed();
-                        }
+                    if let Some(track) = self.tracks.get_mut(track_index)
+                        && let Some(clip) = track.settings.clips.get_mut(clip_index)
+                    {
+                        let track_name = track.settings.name.clone();
+                        ui.strong("Klip terpilih");
+                        ui.weak(format!(
+                            "{} · {:.2} s",
+                            track_name,
+                            clip.source_end - clip.source_start
+                        ));
+                        inspector_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut clip.gain, 0.0..=4.0)
+                                    .text("Gain klip ×"),
+                            )
+                            .changed();
+                        let max_fade = (clip.source_end - clip.source_start).min(2.0);
+                        inspector_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut clip.fade_in_seconds, 0.0..=max_fade)
+                                    .text("Fade in"),
+                            )
+                            .changed();
+                        inspector_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut clip.fade_out_seconds, 0.0..=max_fade)
+                                    .text("Fade out"),
+                            )
+                            .changed();
                     }
                     let overlap = crossfade_overlap(&self.tracks, (track_index, clip_index));
                     let crossfade_label = overlap.map_or_else(
