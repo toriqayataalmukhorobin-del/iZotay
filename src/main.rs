@@ -7085,16 +7085,18 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{
         App, Audio, AudioControls, ClipSettings, ExportSettings, GainPoint, MixPlayback,
-        MixRequest, MixWorker, PreparedTrack, SampleBuffer, SampleStorage, SessionFile,
-        SpectrogramCache, Track, TrackSettings, WaveformCache, build_spectrogram,
-        cached_denoise_samples_controlled, cached_pre_effect_samples, default_bleed_reduction,
-        default_deesser_reduction, default_deesser_threshold, default_dereverb_amount,
-        denoise_cache_path, estimate_alignment_offset, estimate_bleed_weights, expander_samples,
-        gain_at_time, highpass_samples, make_render_state, new_track_id, noise_profile_range,
-        peak_data, peak_data_controlled, pre_effect_cache_path, prepare_mix_playback,
-        process_effects_in_preview, process_pre_denoise, process_stage3_effects,
-        prune_sample_cache_with_limit, read_media_audio, read_wav, render, render_mix,
-        source_sample_cache_path, write_mix_wav_24, write_mix_wav_controlled,
+        MixRequest, MixWorker, PreparedTrack, ProductionPreset, SampleBuffer, SampleStorage,
+        SessionFile, SpectrogramCache, Track, TrackSettings, WaveformCache, build_spectrogram,
+        cached_denoise_samples_controlled, cached_pre_effect_samples, consolidate_session_bundle,
+        default_bleed_reduction, default_deesser_reduction, default_deesser_threshold,
+        default_dereverb_amount, denoise_cache_path, estimate_alignment_offset,
+        estimate_bleed_weights, expander_samples, gain_at_time, highpass_samples,
+        make_render_state, new_track_id, noise_profile_range, peak_data, peak_data_controlled,
+        pre_effect_cache_path, prepare_mix_playback, process_effects_in_preview,
+        process_pre_denoise, process_stage3_effects, prune_sample_cache_with_limit,
+        read_media_audio, read_production_preset, read_wav, render, render_mix,
+        source_sample_cache_path, unique_batch_output_path, validate_preset_effects,
+        write_mix_wav_24, write_mix_wav_controlled, write_production_preset,
     };
     use std::sync::{Arc, atomic::Ordering};
 
@@ -7956,6 +7958,106 @@ mod tests {
             serde_json::from_str(r#"{"format_version":1,"sample_rate":48000,"tracks":[]}"#)
                 .unwrap();
         assert!(session.markers.is_empty());
+    }
+
+    #[test]
+    fn production_preset_roundtrip_drops_session_specific_fields() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("izotay-preset-{nonce}.izopreset"));
+        let mut settings = basic_settings();
+        settings.denoise_profile_range = Some((0.5, 1.5));
+        settings.bleed_enabled = true;
+        settings.bleed_reference_track_id = Some(new_track_id());
+        let preset = ProductionPreset {
+            format_version: 1,
+            name: "Voice Over".into(),
+            effects: settings.effect_settings(),
+        };
+        write_production_preset(&preset, &path).unwrap();
+        let restored = read_production_preset(&path).unwrap();
+        assert_eq!(restored.name, "Voice Over");
+        assert!(restored.effects.denoise_profile_range.is_none());
+        assert!(!restored.effects.bleed_enabled);
+        assert!(restored.effects.bleed_reference_track_id.is_none());
+        let mut invalid = restored.effects;
+        invalid.rumble_cutoff_hz = 181.0;
+        assert!(validate_preset_effects(invalid).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn batch_output_names_never_overwrite_existing_files() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("izotay-batch-{nonce}"));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("interview.wav");
+        let first = unique_batch_output_path(&directory, &source, 1).unwrap();
+        std::fs::write(&first, b"kept").unwrap();
+        let second = unique_batch_output_path(&directory, &source, 2).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"kept");
+        assert!(!second.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn consolidated_session_uses_relocatable_deduplicated_media_paths() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("izotay-project-{nonce}"));
+        let source_dir = root.join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("dialog.wav");
+        std::fs::write(&source, b"source media bytes").unwrap();
+        let mut first = basic_settings();
+        first.path = source.display().to_string();
+        first.clips.push(ClipSettings {
+            source_start: 0.0,
+            source_end: 1.0,
+            position: 0.0,
+            fade_in_seconds: 0.0,
+            fade_out_seconds: 0.0,
+            gain: 1.0,
+        });
+        let mut second = first.clone();
+        second.track_id = new_track_id();
+        let session = SessionFile {
+            format_version: 17,
+            sample_rate: 48_000,
+            tracks: vec![first, second],
+            markers: Vec::new(),
+            export_sample_rate: 0,
+            export_bit_depth: 24,
+            normalize_peak: false,
+            effect_a: None,
+            timeline_zoom: 1.0,
+            snap_enabled: false,
+            snap_grid_enabled: false,
+            snap_grid_interval: 0.5,
+            timeline_track_height: 72.0,
+            ui_scale: 1.0,
+            high_contrast: false,
+        };
+        let result = consolidate_session_bundle(&root, session).unwrap();
+        assert_eq!(result.paths.len(), 2);
+        assert_eq!(result.paths[0], result.paths[1]);
+        let bytes = std::fs::read(&result.session_path).unwrap();
+        let bundled: SessionFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bundled.tracks[0].path, bundled.tracks[1].path);
+        assert!(std::path::Path::new(&bundled.tracks[0].path).is_relative());
+        let moved = root.join("moved project");
+        std::fs::rename(result.session_path.parent().unwrap(), &moved).unwrap();
+        assert!(moved.join(&bundled.tracks[0].path).is_file());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source media bytes");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
