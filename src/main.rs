@@ -2928,8 +2928,6 @@ impl App {
                     "izotay-video-audio-{}-{nonce}.wav",
                     std::process::id()
                 ));
-                let video_temp = destination
-                    .with_file_name(format!(".izotay-render-{}-{nonce}.mp4", std::process::id()));
                 let result = (|| {
                     let playback = prepare_mix_playback(&[track], Some(&cancel))?;
                     let (render_progress, render_progress_rx) = mpsc::channel();
@@ -2953,75 +2951,11 @@ impl App {
                         return Err("Ekspor dibatalkan".into());
                     }
                     let _ = progress.send(ExportMessage::Progress(0.75));
-                    let mut child = std::process::Command::new("ffmpeg")
-                        .args(["-nostdin", "-y", "-v", "error", "-i"])
-                        .arg(&source_video)
-                        .args(["-i"])
-                        .arg(&audio_temp)
-                        .args([
-                            "-map",
-                            "0:v:0?",
-                            "-map",
-                            "1:a:0",
-                            "-map_metadata",
-                            "0",
-                            "-c:v",
-                            "copy",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-af",
-                            "apad",
-                            "-shortest",
-                            "-movflags",
-                            "+faststart",
-                            "-f",
-                            "mp4",
-                        ])
-                        .arg(&video_temp)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()
-                        .map_err(|error| {
-                            if error.kind() == std::io::ErrorKind::NotFound {
-                                "FFmpeg diperlukan untuk membuat video MP4".to_owned()
-                            } else {
-                                format!("Gagal menjalankan FFmpeg: {error}")
-                            }
-                        })?;
-                    loop {
-                        if cancel.load(Ordering::Relaxed) {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err("Ekspor dibatalkan".into());
-                        }
-                        if child
-                            .try_wait()
-                            .map_err(|error| error.to_string())?
-                            .is_some()
-                        {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    let output = child
-                        .wait_with_output()
-                        .map_err(|error| error.to_string())?;
-                    if !output.status.success() {
-                        return Err(format!(
-                            "FFmpeg gagal membuat MP4: {}",
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        ));
-                    }
-                    replace_output(&video_temp, &destination)?;
+                    mux_edited_audio_into_mp4(&source_video, &audio_temp, &destination, &cancel)?;
                     let _ = progress.send(ExportMessage::Progress(1.0));
                     Ok(())
                 })();
                 let _ = std::fs::remove_file(audio_temp);
-                if result.is_err() {
-                    let _ = std::fs::remove_file(video_temp);
-                }
                 result
             });
         }
@@ -6633,6 +6567,98 @@ fn is_video_file(path: &std::path::Path) -> bool {
                 .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         })
 }
+
+fn mux_edited_audio_into_mp4(
+    source_video: &std::path::Path,
+    audio_wav: &std::path::Path,
+    destination: &std::path::Path,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let video_temp =
+        destination.with_file_name(format!(".izotay-render-{}-{nonce}.mp4", std::process::id()));
+    let mut child = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-y", "-v", "error", "-i"])
+        .arg(source_video)
+        .args(["-i"])
+        .arg(audio_wav)
+        .args([
+            "-map",
+            "0:v:0?",
+            "-map",
+            "1:a:0",
+            "-map_metadata",
+            "0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-af",
+            "apad",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+        ])
+        .arg(&video_temp)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "FFmpeg diperlukan untuk membuat video MP4".to_owned()
+            } else {
+                format!("Gagal menjalankan FFmpeg: {error}")
+            }
+        })?;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&video_temp);
+            return Err("Ekspor dibatalkan".into());
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&video_temp);
+                return Err(error.to_string());
+            }
+        }
+    }
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = std::fs::remove_file(&video_temp);
+            return Err(error.to_string());
+        }
+    };
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&video_temp);
+        return Err(format!(
+            "FFmpeg gagal membuat MP4: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&video_temp);
+        return Err("Ekspor dibatalkan".into());
+    }
+    let replace_result = replace_output(&video_temp, destination);
+    if replace_result.is_err() {
+        let _ = std::fs::remove_file(&video_temp);
+    }
+    replace_result
+}
 #[cfg(test)]
 fn peak_data(samples: &[f32], channels: usize, bins: usize) -> Vec<f32> {
     peak_data_controlled(samples, channels, bins, None)
@@ -7096,11 +7122,11 @@ mod tests {
         default_bleed_reduction, default_deesser_reduction, default_deesser_threshold,
         default_dereverb_amount, denoise_cache_path, estimate_alignment_offset,
         estimate_bleed_weights, expander_samples, gain_at_time, highpass_samples,
-        make_render_state, new_track_id, noise_profile_range, peak_data, peak_data_controlled,
-        pre_effect_cache_path, prepare_mix_playback, process_effects_in_preview,
-        process_pre_denoise, process_stage3_effects, prune_sample_cache_with_limit,
-        read_media_audio, read_production_preset, read_wav, render, render_mix,
-        source_sample_cache_path, unique_batch_output_path, validate_preset_effects,
+        make_render_state, mux_edited_audio_into_mp4, new_track_id, noise_profile_range, peak_data,
+        peak_data_controlled, pre_effect_cache_path, prepare_mix_playback,
+        process_effects_in_preview, process_pre_denoise, process_stage3_effects,
+        prune_sample_cache_with_limit, read_media_audio, read_production_preset, read_wav, render,
+        render_mix, source_sample_cache_path, unique_batch_output_path, validate_preset_effects,
         write_mix_wav_24, write_mix_wav_controlled, write_production_preset,
     };
     use std::sync::{Arc, atomic::Ordering};
@@ -7947,6 +7973,85 @@ mod tests {
         drop(decoded);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(cache_path).unwrap();
+    }
+
+    #[test]
+    fn ffmpeg_exports_edited_audio_into_new_video_without_changing_source() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "izotay-video-export-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.mp4");
+        let edited_audio = directory.join("edited.wav");
+        let output = directory.join("edited-video.mp4");
+        let source_status = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=64x64:r=10:d=1",
+                "-an",
+                "-c:v",
+                "mpeg4",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(source_status.success(), "failed to create test video");
+        let source_bytes = std::fs::read(&source).unwrap();
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&edited_audio, spec).unwrap();
+        for frame in 0..24_000 {
+            let sample = (0.25
+                * (std::f32::consts::TAU * 440.0 * frame as f32 / 48_000.0).sin()
+                * i16::MAX as f32) as i16;
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        mux_edited_audio_into_mp4(
+            &source,
+            &edited_audio,
+            &output,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        assert!(std::fs::metadata(&output).unwrap().len() > 0);
+        for stream in ["0:v:0", "0:a:0"] {
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-nostdin", "-v", "error", "-i"])
+                .arg(&output)
+                .args(["-map", stream, "-f", "null", "-"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "output MP4 is missing/invalid {stream}");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
