@@ -3308,28 +3308,33 @@ impl eframe::App for App {
             self.import_files();
         }
         let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(9.0, 7.0);
-        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(14.0, 9.0);
         style.spacing.interact_size.y = 32.0;
         style.spacing.slider_width = 150.0;
-        style.visuals.panel_fill = egui::Color32::from_rgb(15, 22, 29);
-        style.visuals.window_fill = egui::Color32::from_rgb(24, 34, 43);
-        style.visuals.extreme_bg_color = egui::Color32::from_rgb(9, 14, 19);
-        style.visuals.faint_bg_color = egui::Color32::from_rgb(25, 36, 45);
-        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(34, 48, 58);
-        style.visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(215, 225, 230);
-        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(42, 99, 91);
-        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(37, 133, 116);
-        style.visuals.selection.bg_fill = egui::Color32::from_rgb(32, 112, 99);
+        style.visuals.panel_fill = egui::Color32::from_rgb(18, 23, 25);
+        style.visuals.window_fill = egui::Color32::from_rgb(27, 34, 36);
+        style.visuals.extreme_bg_color = egui::Color32::from_rgb(10, 13, 14);
+        style.visuals.faint_bg_color = egui::Color32::from_rgb(31, 40, 42);
+        style.visuals.override_text_color = Some(egui::Color32::from_rgb(226, 234, 232));
+        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(37, 47, 49);
+        style.visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(226, 234, 232);
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(43, 70, 65);
+        style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(24, 112, 94);
+        style.visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+        style.visuals.hyperlink_color = egui::Color32::from_rgb(91, 207, 181);
+        style.visuals.selection.bg_fill = egui::Color32::from_rgb(24, 103, 87);
         style.visuals.widgets.active.bg_stroke =
-            egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(255, 220, 75));
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(103, 222, 192));
         style.visuals.widgets.hovered.bg_stroke =
-            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 220, 75));
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(103, 222, 192));
         if self.high_contrast {
             style.visuals.panel_fill = egui::Color32::BLACK;
             style.visuals.window_fill = egui::Color32::from_rgb(8, 8, 8);
             style.visuals.extreme_bg_color = egui::Color32::BLACK;
             style.visuals.faint_bg_color = egui::Color32::from_gray(28);
+            style.visuals.override_text_color = Some(egui::Color32::WHITE);
             style.visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(44);
             style.visuals.widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
             style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0, 80, 170);
