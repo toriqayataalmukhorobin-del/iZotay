@@ -1,0 +1,76 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libasound2-dev libgl1-mesa-dev libwayland-dev libx11-dev libxkbcommon-dev pkg-config
+
+      - name: Install FFmpeg on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+          }
+
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install Rust quality tools
+        run: rustup component add rustfmt clippy --toolchain stable
+
+      - name: Check formatting
+        run: cargo +stable fmt --check
+
+      - name: Run tests
+        run: cargo +stable test
+
+      - name: Run Clippy
+        run: cargo +stable clippy --all-targets -- -D warnings
+
+      - name: Build release binary
+        run: cargo +stable build --release
+
+      - name: Upload Windows binary
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: izotay-${{ runner.os }}-${{ runner.arch }}
+          path: target/release/izotay.exe
+          if-no-files-found: error
+
+      - name: Upload Unix binary
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: izotay-${{ runner.os }}-${{ runner.arch }}
+          path: target/release/izotay
+          if-no-files-found: error
