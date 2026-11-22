@@ -1,6 +1,6 @@
 # Editor Multi-track — Keputusan Teknis
 
-Status: prototipe editor multi-track tahap 1 dengan beberapa fondasi tahap 2; belum siap dibekukan sebagai teknologi produksi.
+Status: implementasi Tahap 2 untuk pipeline media panjang selesai: sumber dan hasil DSP diproses bertahap ke cache file-backed, dengan waveform multi-resolusi. Aplikasi tetap prototipe sampai validasi media nyata dan lintas sistem operasi selesai.
 
 ## Pilihan prototipe
 
@@ -29,12 +29,12 @@ Status: prototipe editor multi-track tahap 1 dengan beberapa fondasi tahap 2; be
 - Marker timeline dengan label otomatis; klik marker untuk memindahkan playhead. Marker ikut tersimpan dan dipulihkan oleh undo/redo.
 - Playback mencampur frame dari track yang telah diproses di callback audio dan tetap berjalan memakai mix terakhir saat render baru berlangsung; mix terbaru melanjutkan dari posisi playhead. Mix stereo/track diekspor bertahap tanpa membuat buffer output berdurasi penuh. Ekspor WAV mendukung PCM 16/24/32-bit, pilihan sample rate 44,1/48/96/192 kHz atau mengikuti sumber, normalisasi peak ke −1 dBFS dengan batas boost +40 dB, progres, dan pembatalan. File tujuan baru diganti setelah file sementara selesai ditulis.
 - Track dari video dapat diekspor sebagai MP4 baru dengan audio hasil edit; stream video disalin tanpa re-encode dan audio dikodekan AAC. FFmpeg diperlukan untuk impor maupun ekspor video.
-- Impor media berjalan di worker dan dapat dibatalkan; decode WAV, keluaran FFmpeg, penulisan cache sumber, serta pembuatan waveform berjalan bertahap dan memeriksa pembatalan. Track yang selesai tetap dipertahankan. Cache sampel yang cocok dipetakan ulang tanpa decode media; playback membaca sampel langsung dari pemetaan, dan saat semua efek bypass mix memakai sumber yang sama tanpa salinan penuh. Pembukaan sesi, penghitungan filter/mix, dan render ekspor juga berjalan di worker latar belakang. Antrean mix hanya menyimpan permintaan terbaru dan membatalkan render lama saat pengaturan berubah.
-- High-pass rumble per track dengan rentang 0–180 Hz dan bypass untuk perbandingan cepat. Filter satu pole diproses dari salinan buffer, bukan sumber.
+- Impor media berjalan di worker dan dapat dibatalkan; decode WAV, keluaran FFmpeg, penulisan cache sumber, serta pembuatan waveform berjalan bertahap dan memeriksa pembatalan. Track yang selesai tetap dipertahankan. Cache sampel yang cocok dipetakan ulang tanpa decode media. Filter aktif berjalan per frame dan menulis hasilnya ke cache file-backed; mix tanpa efek memakai sumber langsung tanpa salinan penuh. Pembukaan sesi, penghitungan filter/mix, dan render ekspor juga berjalan di worker latar belakang. Antrean mix hanya menyimpan permintaan terbaru dan membatalkan render lama saat pengaturan berubah.
+- High-pass rumble per track dengan rentang 0–180 Hz dan bypass untuk perbandingan cepat; pemrosesan per frame memakai state filter berkelanjutan dan cache hasil.
 - Hum removal per track dengan pilihan listrik 50/60 Hz, notch sempit pada fundamental dan sampai delapan harmonik, serta bypass.
-- Denoise spektral per track melalui FFmpeg `afftdn`, pengurangan 0–30 dB, bypass, A/B, dan rentang profil noise dari bagian seleksi yang hanya berisi noise latar; sumber tetap utuh.
+- Denoise spektral per track melalui FFmpeg `afftdn`, pengurangan 0–30 dB, bypass, A/B, dan rentang profil noise dari bagian seleksi yang hanya berisi noise latar; input serta keluaran full-track dialirkan bertahap, sumber tetap utuh.
 - Perbandingan A/B untuk parameter rumble, hum, expander, dan denoise per track; set A tersimpan dalam sesi sementara kontrol tetap mengedit set B.
-- Expander per track dengan threshold -60 hingga -20 dBFS, bypass, penurunan level konservatif sekitar 15 dB, attack 10 ms, dan release 120 ms.
+- Expander per track dengan threshold -60 hingga -20 dBFS, bypass, penurunan level konservatif sekitar 15 dB, attack 10 ms, dan release 120 ms; envelope dipertahankan antar-frame saat hasil ditulis ke cache.
 - Meter peak master live menampilkan level linear dan dBFS dari callback output; meter per track menunjukkan peak pada jendela 10 ms di sekitar playhead.
 - Simpan/buka sesi `.izotay` versi 14; versi 1–13 tetap dibaca. Gain klip baru memakai default 1×, zoom memakai nilai default, snap nonaktif, dan tinggi lane memakai nilai default pada sesi lama. Rentang profil noise, pengaturan ekspor, dan set A ikut disimpan. Sumber media direferensikan lewat path, bukan disalin ke sesi.
 - Sesi tetap dapat dibuka saat sumber tidak tersedia; track ditandai offline dan dapat ditautkan ulang lewat dialog file. Klip yang melewati durasi sumber baru dipangkas ke rentang valid.
@@ -42,24 +42,22 @@ Status: prototipe editor multi-track tahap 1 dengan beberapa fondasi tahap 2; be
 
 ## Batas yang diketahui
 
-- Sumber hasil decode disimpan di cache sementara dan dipetakan read-only agar halaman sampel dapat dikelola oleh sistem operasi; ruang disk cache setara PCM float hasil decode dan entri lama belum dibersihkan otomatis. Filter aktif masih memproses track penuh ke buffer baru, sehingga sesi berefek pada sumber panjang tetap dapat memakai banyak RAM. Cache waveform bertingkat menambah sekitar 5,4 MB per jam sumber 48 kHz dan dapat dibangun ulang jika hilang. Impor dan ekspor video memerlukan executable FFmpeg di PATH.
+- Cache sumber, hasil filter, dan denoise disimpan sementara sebagai PCM float serta dipetakan read-only. Cache disentuh saat dipakai dan dibersihkan menurut waktu akses ketika direktori melewati batas 4 GiB; file sementara yatim berumur lebih dari 24 jam juga dibuang. Batas ukuran bersifat upaya terbaik jika satu cache aktif saja melampaui batas atau sistem menolak menghapus file yang sedang dipetakan. Cache waveform menambah sekitar 5,4 MB per jam sumber 48 kHz dan dapat dibangun ulang. Impor dan ekspor video memerlukan executable FFmpeg di PATH.
 - Klip hasil impor dimulai di waktu nol; pemindahan, split, trim, dan hapus tersedia.
 - Undo/redo mencakup edit dan pengelolaan track sampai 100 langkah. Setelah sesi disimpan dan diedit, autosave dibuat setelah jeda 2 detik; saat membuka sesi, autosave yang lebih baru dipulihkan ke memori tanpa menimpa file sesi.
 - Ekspor track menerapkan efek yang sedang aktif. Pembatalan diperiksa selama filter dan penulisan, tetapi operasi sistem berkas saat mengganti file tidak dapat dihentikan di tengah.
 - Normalisasi mengukur peak sample pada rentang ekspor, bukan loudness LUFS; boost dibatasi 40 dB agar rekaman sangat pelan tidak dinaikkan tanpa batas.
 - Notch hum dapat mengurangi komponen suara yang kebetulan berada dekat harmoniknya; bypass tersedia, dan hasil tetap perlu didengar pada rekaman sasaran.
 - Denoise memerlukan build FFmpeg dengan filter `afftdn`; satu rentang noise-only terpanjang dari seleksi dipakai untuk sampling profil setiap kali mix dirender, lalu pemrosesan diterapkan pada seluruh track. Expander perlu diuji pada dialog pelan sebelum dipakai di produksi.
-- Playback menghitung mix per frame di callback audio dan tidak menyimpan buffer mix penuh. Sumber audio memakai pemetaan cache file; efek aktif masih membuat buffer pemrosesan penuh. Daftar klip yang sangat padat dapat menambah beban callback.
-- Preview gambar video belum tersedia. Loop hanya mengulang rentang waktu yang dipilih. Mode preview seleksi memproses konteks 250 ms di sekitar potongan sumber agar filter stabil; ekspor selalu merender efek pada seluruh track.
+- Playback menghitung mix per frame di callback audio dan tidak menyimpan buffer mix penuh. Sumber dan hasil efek full-track memakai pemetaan cache file; daftar klip yang sangat padat dapat menambah beban callback.
+- Preview gambar video belum tersedia. Loop hanya mengulang rentang waktu yang dipilih. Mode preview seleksi menyimpan hasil efek pada rentang terpilih beserta konteks 250 ms di memori agar filter stabil; seleksi yang sangat panjang dapat memakai RAM besar. Ekspor selalu merender efek pada seluruh track dan memakai cache file-backed.
 - Meter live master dibaca dari callback output; meter track menampilkan peak pada jendela 10 ms di sekitar playhead.
 - Batas loop belum memakai crossfade; pilih rentang dengan transisi yang bersih untuk menghindari klik.
 - Relink memangkas klip yang sumbernya melebihi durasi berkas yang dipilih; kecocokan identitas media belum diverifikasi otomatis.
 - Penggantian file sesi memakai file sementara dan cadangan agar dapat berjalan pada sistem yang tidak mendukung rename langsung di atas file yang ada.
-- `cargo check`, build debug, dan Clippy dengan warning sebagai error bersih setelah perubahan media. Unit test tidak dijalankan ulang. UI berhasil dibuka pada desktop; uji alur impor/ekspor media dan validasi lintas Windows/macOS masih diperlukan.
+- `cargo test` (20 test), `cargo check`, build debug, Clippy dengan warning sebagai error, dan `git diff --check` bersih. Tes mencakup WAV PCM 16/24/32-bit dan float, impor FFmpeg non-WAV, seluruh sample rate/bit depth ekspor, resampling, roundtrip sesi, preview/profil noise, pruning cache, kesetaraan DSP bertahap, serta FFmpeg denoise bila tersedia. Uji alur UI pada rekaman dialog nyata dan validasi lintas Windows/macOS masih diperlukan.
 
-## Langkah validasi berikutnya
+## Validasi sebelum rilis
 
-1. Uji impor, sesi, playback, dan ekspor pada aplikasi berjalan dengan WAV mono/stereo, PCM 16/24/32-bit, float, serta sample rate berbeda.
-2. Ubah filter aktif menjadi pemrosesan blok dan tambahkan pengelolaan batas cache disk agar track panjang dengan efek aktif tidak membuat buffer penuh di RAM.
-3. Uji preview seleksi dan profil noise pada rekaman dialog nyata, terutama transien dan seleksi dekat batas klip.
-4. Uji sistem operasi sasaran, latensi, lisensi, dan packaging sebelum teknologi dianggap final.
+1. Uji impor, sesi, playback, preview, dan ekspor di UI pada rekaman dialog nyata, termasuk transien, noise profile, dan seleksi panjang.
+2. Uji Windows/macOS, latensi audio, lisensi dependensi, serta packaging installer sebelum teknologi dianggap final.

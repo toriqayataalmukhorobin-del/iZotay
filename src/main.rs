@@ -1,7 +1,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     mpsc::{self, Receiver},
 };
 
@@ -20,6 +20,7 @@ struct Audio {
 }
 enum SampleStorage {
     Owned(Vec<f32>),
+    #[cfg(target_endian = "little")]
     Mapped(memmap2::Mmap),
 }
 struct SampleBuffer {
@@ -74,6 +75,7 @@ impl std::ops::Deref for SampleBuffer {
     fn deref(&self) -> &Self::Target {
         match &self.storage {
             SampleStorage::Owned(samples) => samples,
+            #[cfg(target_endian = "little")]
             SampleStorage::Mapped(map) => {
                 // SAFETY: sample cache files are written as contiguous little-endian f32 values;
                 // the mapping starts page-aligned and its length was checked above.
@@ -3646,6 +3648,252 @@ fn denoise_samples_controlled(
         .collect())
 }
 
+fn denoise_cache_path(
+    source_identity: &std::path::Path,
+    sample_rate: u32,
+    channels: usize,
+    reduction_db: f32,
+    profile_range: Option<(f64, f64)>,
+) -> std::path::PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_identity.hash(&mut hasher);
+    sample_rate.hash(&mut hasher);
+    channels.hash(&mut hasher);
+    reduction_db.to_bits().hash(&mut hasher);
+    if let Some((start, end)) = profile_range {
+        1u8.hash(&mut hasher);
+        start.to_bits().hash(&mut hasher);
+        end.to_bits().hash(&mut hasher);
+    } else {
+        0u8.hash(&mut hasher);
+    }
+    std::env::temp_dir()
+        .join("izotay-source-cache")
+        .join(format!("{:016x}.f32", hasher.finish()))
+}
+
+fn drain_ffmpeg_f32le(
+    mut reader: impl std::io::Read,
+    mut writer: SourceCacheWriter,
+) -> Result<SourceCacheWriter, String> {
+    let mut buffer = [0u8; 65_536];
+    let mut carry = [0u8; 4];
+    let mut carry_len = 0usize;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("Gagal membaca hasil denoise: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        let mut offset = 0usize;
+        if carry_len > 0 {
+            let take = (4 - carry_len).min(count);
+            carry[carry_len..carry_len + take].copy_from_slice(&buffer[..take]);
+            carry_len += take;
+            offset += take;
+            if carry_len < 4 {
+                continue;
+            }
+            let value = f32::from_le_bytes(carry);
+            writer.append_sample(if value.is_finite() { value } else { 0.0 })?;
+        }
+        let aligned_end = offset + ((count - offset) / 4) * 4;
+        for sample_bytes in buffer[offset..aligned_end].as_chunks::<4>().0 {
+            let value = f32::from_le_bytes(*sample_bytes);
+            writer.append_sample(if value.is_finite() { value } else { 0.0 })?;
+        }
+        carry_len = count - aligned_end;
+        if carry_len > 0 {
+            carry[..carry_len].copy_from_slice(&buffer[aligned_end..count]);
+        }
+    }
+    if carry_len > 0 {
+        return Err("FFmpeg menghasilkan data denoise yang tidak utuh".into());
+    }
+    Ok(writer)
+}
+
+fn denoise_samples_to_cache_controlled(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    reduction_db: f32,
+    profile_range: Option<(f64, f64)>,
+    output_path: std::path::PathBuf,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Arc<SampleBuffer>, String> {
+    if channels == 0 || sample_rate == 0 || samples.is_empty() {
+        return Err("Sumber audio tidak valid untuk denoise".into());
+    }
+    if !reduction_db.is_finite() || !(0.0..=30.0).contains(&reduction_db) {
+        return Err("Pengaturan denoise tidak valid".into());
+    }
+    let filter = if let Some((start, end)) =
+        profile_range.filter(|(start, end)| start.is_finite() && end.is_finite() && *end > *start)
+    {
+        format!(
+            "asendcmd={start:.9} afftdn sn start,asendcmd={end:.9} afftdn sn stop,afftdn=nr={reduction_db:.1}:nf=-50:tn=0"
+        )
+    } else {
+        format!("afftdn=nr={reduction_db:.1}:nf=-50:tn=1")
+    };
+    let output_writer = SourceCacheWriter::new_at(output_path, channels)?;
+    let mut child = std::process::Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-f",
+            "f32le",
+            "-ar",
+        ])
+        .arg(sample_rate.to_string())
+        .arg("-ac")
+        .arg(channels.to_string())
+        .args(["-i", "pipe:0", "-af"])
+        .arg(filter)
+        .args(["-f", "f32le", "pipe:1"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "FFmpeg diperlukan untuk denoise. Pasang FFmpeg lalu coba lagi.".to_owned()
+            } else {
+                format!("Gagal menjalankan FFmpeg denoise: {error}")
+            }
+        })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Output FFmpeg denoise tidak tersedia".to_owned())?;
+    let stdout_failed = Arc::new(AtomicBool::new(false));
+    let stdout_failed_worker = stdout_failed.clone();
+    let stdout_reader = std::thread::spawn(move || {
+        let result = drain_ffmpeg_f32le(stdout, output_writer);
+        if result.is_err() {
+            stdout_failed_worker.store(true, Ordering::Release);
+        }
+        result
+    });
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Log FFmpeg denoise tidak tersedia".to_owned())?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stderr, &mut bytes).map(|_| bytes)
+    });
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Input FFmpeg denoise tidak tersedia".to_owned())?;
+    let write_result = (|| -> Result<(), String> {
+        for chunk in samples.chunks(16_384) {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err("Render mix dibatalkan".into());
+            }
+            let mut bytes = Vec::with_capacity(chunk.len() * 4);
+            for sample in chunk {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            std::io::Write::write_all(&mut input, &bytes)
+                .map_err(|error| format!("Gagal mengirim audio ke FFmpeg: {error}"))?;
+        }
+        Ok(())
+    })();
+    drop(input);
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        return Err(error);
+    }
+    loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("Render mix dibatalkan".into());
+        }
+        if stdout_failed.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let result = stdout_reader
+                .join()
+                .map_err(|_| "Pembaca output FFmpeg berhenti tiba-tiba".to_owned())?;
+            let _ = stderr_reader.join();
+            return Err(result
+                .err()
+                .unwrap_or_else(|| "Pembaca output FFmpeg denoise gagal".to_owned()));
+        }
+        if child
+            .try_wait()
+            .map_err(|error| format!("Gagal menunggu FFmpeg denoise: {error}"))?
+            .is_some()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("Gagal menunggu FFmpeg denoise: {error}"))?;
+    let output_writer = stdout_reader
+        .join()
+        .map_err(|_| "Pembaca output FFmpeg berhenti tiba-tiba".to_owned())??;
+    let error_output = stderr_reader
+        .join()
+        .map_err(|_| "Pembaca log FFmpeg berhenti tiba-tiba".to_owned())?
+        .map_err(|error| format!("Gagal membaca log FFmpeg: {error}"))?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&error_output);
+        return Err(format!(
+            "FFmpeg tidak dapat memproses denoise: {}",
+            detail.trim()
+        ));
+    }
+    if output_writer.sample_count != samples.len() {
+        return Err("FFmpeg menghasilkan durasi audio denoise yang tidak sesuai".into());
+    }
+    output_writer.finish()
+}
+
+fn cached_denoise_samples_controlled(
+    source_identity: &std::path::Path,
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    reduction_db: f32,
+    profile_range: Option<(f64, f64)>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Arc<SampleBuffer>, String> {
+    let path = denoise_cache_path(
+        source_identity,
+        sample_rate,
+        channels,
+        reduction_db,
+        profile_range,
+    );
+    if let Some(cached) = load_sample_cache_file(&path, channels) {
+        return Ok(cached);
+    }
+    denoise_samples_to_cache_controlled(
+        samples,
+        channels,
+        sample_rate,
+        reduction_db,
+        profile_range,
+        path,
+        cancelled,
+    )
+}
+
 #[cfg(test)]
 fn render_mix(tracks: &[Track]) -> Result<MixRender, String> {
     render_mix_internal(tracks, None, None)
@@ -3688,6 +3936,171 @@ fn process_pre_denoise(
         )?;
     }
     Ok(output)
+}
+
+fn pre_effect_cache_path(
+    source_path: &std::path::Path,
+    sample_rate: u32,
+    channels: usize,
+    settings: &TrackSettings,
+) -> Option<std::path::PathBuf> {
+    let source_cache = source_sample_cache_path(source_path, sample_rate, channels)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_cache.hash(&mut hasher);
+    settings.rumble_bypass.hash(&mut hasher);
+    settings.rumble_cutoff_hz.to_bits().hash(&mut hasher);
+    settings.hum_bypass.hash(&mut hasher);
+    settings.hum_frequency_hz.hash(&mut hasher);
+    settings.gate_bypass.hash(&mut hasher);
+    settings.gate_threshold_db.to_bits().hash(&mut hasher);
+    Some(
+        std::env::temp_dir()
+            .join("izotay-source-cache")
+            .join(format!("{:016x}.f32", hasher.finish())),
+    )
+}
+
+struct HumStage {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    delay: Vec<[f32; 2]>,
+}
+
+fn cache_pre_effects(
+    source: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    settings: &TrackSettings,
+    cancelled: Option<&AtomicBool>,
+    output: &mut SourceCacheWriter,
+) -> Result<(), String> {
+    if channels == 0 || sample_rate == 0 || !source.len().is_multiple_of(channels) {
+        return Err("Sumber audio tidak valid untuk pemrosesan efek".into());
+    }
+    let frame_count = source.len() / channels;
+    let mut frame = vec![0.0f32; channels];
+    let highpass_cutoff = (!settings.rumble_bypass && settings.rumble_cutoff_hz > 0.0)
+        .then_some(settings.rumble_cutoff_hz.min(sample_rate as f32 * 0.45));
+    let highpass_alpha =
+        highpass_cutoff.map(|cutoff| (-std::f32::consts::TAU * cutoff / sample_rate as f32).exp());
+    let mut highpass_input = vec![0.0f32; channels];
+    let mut highpass_output = vec![0.0f32; channels];
+
+    let mut hum_stages = Vec::new();
+    if !settings.hum_bypass {
+        if !matches!(settings.hum_frequency_hz, 50 | 60) {
+            return Err("Pengaturan hum removal tidak valid".into());
+        }
+        for harmonic in 1..=8 {
+            let frequency = settings.hum_frequency_hz as f32 * harmonic as f32;
+            if frequency >= sample_rate as f32 * 0.45 {
+                break;
+            }
+            let omega = std::f32::consts::TAU * frequency / sample_rate as f32;
+            let cosine = omega.cos();
+            let alpha = omega.sin() / (2.0 * 30.0);
+            let a0 = 1.0 + alpha;
+            hum_stages.push(HumStage {
+                b0: 1.0 / a0,
+                b1: -2.0 * cosine / a0,
+                b2: 1.0 / a0,
+                a1: -2.0 * cosine / a0,
+                a2: (1.0 - alpha) / a0,
+                delay: vec![[0.0; 2]; channels],
+            });
+        }
+    }
+
+    let gate_enabled = !settings.gate_bypass;
+    let threshold = 10.0f32.powf(settings.gate_threshold_db.clamp(-80.0, 0.0) / 20.0);
+    let attack = 1.0 - (-1.0 / (sample_rate as f32 * 0.01)).exp();
+    let release = 1.0 - (-1.0 / (sample_rate as f32 * 0.12)).exp();
+    let mut envelope = 0.0f32;
+    let mut gate_gain = 1.0f32;
+
+    for frame_index in 0..frame_count {
+        if frame_index % 16_384 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("Render mix dibatalkan".into());
+        }
+        let start = frame_index * channels;
+        frame.copy_from_slice(&source[start..start + channels]);
+        if let Some(alpha) = highpass_alpha {
+            for channel in 0..channels {
+                let input = frame[channel];
+                let filtered = alpha * (highpass_output[channel] + input - highpass_input[channel]);
+                highpass_input[channel] = input;
+                highpass_output[channel] = filtered;
+                frame[channel] = filtered;
+            }
+        }
+        for stage in &mut hum_stages {
+            for (channel, delay) in stage.delay.iter_mut().enumerate() {
+                let input = frame[channel];
+                let filtered = stage.b0 * input + delay[0];
+                delay[0] = stage.b1 * input - stage.a1 * filtered + delay[1];
+                delay[1] = stage.b2 * input - stage.a2 * filtered;
+                frame[channel] = filtered;
+            }
+        }
+        if gate_enabled {
+            let level = frame
+                .iter()
+                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+            let envelope_coefficient = if level > envelope { attack } else { release };
+            envelope += (level - envelope) * envelope_coefficient;
+            let target_gain = if envelope < threshold { 0.18 } else { 1.0 };
+            let gain_coefficient = if target_gain > gate_gain {
+                attack
+            } else {
+                release
+            };
+            gate_gain += (target_gain - gate_gain) * gain_coefficient;
+            for sample in &mut frame {
+                *sample *= gate_gain;
+            }
+        }
+        for sample in &frame {
+            output.append_sample(*sample)?;
+        }
+    }
+    Ok(())
+}
+
+fn cached_pre_effect_samples(
+    source_path: &std::path::Path,
+    source: &Arc<SampleBuffer>,
+    channels: usize,
+    sample_rate: u32,
+    settings: &TrackSettings,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Arc<SampleBuffer>, String> {
+    let needs_processing = (!settings.rumble_bypass && settings.rumble_cutoff_hz > 0.0)
+        || !settings.hum_bypass
+        || !settings.gate_bypass;
+    if !needs_processing {
+        return Ok(source.clone());
+    }
+    let path = pre_effect_cache_path(source_path, sample_rate, channels, settings)
+        .ok_or_else(|| "Cache efek tidak dapat dibuat untuk media ini".to_owned())?;
+    if let Some(cached) = load_sample_cache_file(&path, channels) {
+        return Ok(cached);
+    }
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err("Render mix dibatalkan".into());
+    }
+    let mut writer = SourceCacheWriter::new_at(path, channels)?;
+    cache_pre_effects(
+        source,
+        channels,
+        sample_rate,
+        settings,
+        cancelled,
+        &mut writer,
+    )?;
+    writer.finish()
 }
 
 fn process_effect_region(
@@ -3898,23 +4311,24 @@ fn prepare_mix_playback_with_preview(
                 )?,
             )
         } else {
-            let needs_pre_processing = (!track.settings.rumble_bypass
-                && track.settings.rumble_cutoff_hz > 0.0)
-                || !track.settings.hum_bypass
-                || !track.settings.gate_bypass;
-            let mut samples = if needs_pre_processing {
-                Arc::new(SampleBuffer::owned(process_pre_denoise(
-                    &track.audio.samples,
-                    channels,
-                    track.audio.sample_rate,
-                    &track.settings,
-                    cancelled,
-                )?))
-            } else {
-                track.audio.samples.clone()
-            };
+            let mut samples = cached_pre_effect_samples(
+                std::path::Path::new(&track.settings.path),
+                &track.audio.samples,
+                channels,
+                track.audio.sample_rate,
+                &track.settings,
+                cancelled,
+            )?;
             if !track.settings.denoise_bypass && track.settings.denoise_reduction_db > 0.0 {
-                let denoised = denoise_samples_controlled(
+                let pre_effect_identity = pre_effect_cache_path(
+                    std::path::Path::new(&track.settings.path),
+                    track.audio.sample_rate,
+                    channels,
+                    &track.settings,
+                )
+                .ok_or_else(|| "Cache denoise tidak dapat dibuat untuk media ini".to_owned())?;
+                samples = cached_denoise_samples_controlled(
+                    &pre_effect_identity,
                     &samples,
                     channels,
                     track.audio.sample_rate,
@@ -3922,7 +4336,6 @@ fn prepare_mix_playback_with_preview(
                     track.settings.denoise_profile_range,
                     cancelled,
                 )?;
-                samples = Arc::new(SampleBuffer::owned(denoised));
             }
             (samples, Vec::new())
         };
@@ -4192,12 +4605,101 @@ fn load_cached_samples(
     channels: usize,
 ) -> Option<Arc<SampleBuffer>> {
     let path = source_sample_cache_path(source_path, sample_rate, channels)?;
-    let metadata = std::fs::metadata(&path).ok()?;
+    load_sample_cache_file(&path, channels)
+}
+
+fn load_sample_cache_file(path: &std::path::Path, channels: usize) -> Option<Arc<SampleBuffer>> {
+    let metadata = std::fs::metadata(path).ok()?;
     if metadata.len() == 0 || metadata.len() % 4 != 0 {
         return None;
     }
-    let samples = SampleBuffer::mapped(&path, channels).ok()?;
+    let samples = SampleBuffer::mapped(path, channels).ok()?;
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ =
+            file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()));
+    }
+    if let Some(parent) = path.parent() {
+        prune_sample_cache(parent, path);
+    }
     Some(Arc::new(samples))
+}
+
+const SAMPLE_CACHE_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const SAMPLE_CACHE_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+static LAST_SAMPLE_CACHE_PRUNE: AtomicU64 = AtomicU64::new(0);
+
+fn prune_sample_cache(directory: &std::path::Path, protected: &std::path::Path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let previous = LAST_SAMPLE_CACHE_PRUNE.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) < 60
+        || LAST_SAMPLE_CACHE_PRUNE
+            .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    prune_sample_cache_with_limit(directory, protected, SAMPLE_CACHE_LIMIT_BYTES);
+}
+
+fn prune_sample_cache_with_limit(
+    directory: &std::path::Path,
+    protected: &std::path::Path,
+    size_limit: u64,
+) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut caches = Vec::new();
+    let mut total = 0u64;
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("tmp") {
+            if entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > SAMPLE_CACHE_TEMP_MAX_AGE)
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("f32") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let size = metadata.len();
+        total = total.saturating_add(size);
+        caches.push((
+            metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            path,
+            size,
+        ));
+    }
+    if total <= size_limit {
+        return;
+    }
+    caches.sort_unstable_by_key(|(modified, _, _)| *modified);
+    for (_, path, size) in caches {
+        if total <= size_limit {
+            break;
+        }
+        if path == protected {
+            continue;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
 }
 
 struct SourceCacheWriter {
@@ -4216,6 +4718,10 @@ impl SourceCacheWriter {
     ) -> Result<Self, String> {
         let path = source_sample_cache_path(source_path, sample_rate, channels)
             .ok_or_else(|| "Cache sampel tidak dapat dibuat untuk media ini".to_owned())?;
+        Self::new_at(path, channels)
+    }
+
+    fn new_at(path: std::path::PathBuf, channels: usize) -> Result<Self, String> {
         let parent = path
             .parent()
             .ok_or_else(|| "Direktori cache sampel tidak valid".to_owned())?;
@@ -4281,6 +4787,12 @@ impl SourceCacheWriter {
             return Err(format!("Gagal menyimpan cache sampel: {error}"));
         }
         let samples = SampleBuffer::mapped(&self.path, self.channels)?;
+        prune_sample_cache(
+            self.path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+            &self.path,
+        );
         Ok(Arc::new(samples))
     }
 }
@@ -4962,10 +5474,14 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Audio, AudioControls, ClipSettings, MixPlayback, MixRequest, MixWorker, PreparedTrack,
-        SampleBuffer, SessionFile, Track, TrackSettings, WaveformCache, expander_samples,
-        highpass_samples, make_render_state, peak_data, read_wav, render, render_mix,
-        write_mix_wav_24,
+        App, Audio, AudioControls, ClipSettings, ExportSettings, MixPlayback, MixRequest,
+        MixWorker, PreparedTrack, SampleBuffer, SampleStorage, SessionFile, Track, TrackSettings,
+        WaveformCache, cached_denoise_samples_controlled, cached_pre_effect_samples,
+        denoise_cache_path, expander_samples, highpass_samples, make_render_state,
+        noise_profile_range, peak_data, peak_data_controlled, pre_effect_cache_path,
+        process_effects_in_preview, process_pre_denoise, prune_sample_cache_with_limit,
+        read_media_audio, read_wav, render, render_mix, source_sample_cache_path, write_mix_wav_24,
+        write_mix_wav_controlled,
     };
     use std::sync::{Arc, atomic::Ordering};
 
@@ -5002,6 +5518,368 @@ mod tests {
     }
 
     #[test]
+    fn waveform_cancellation_stops_pyramid_build() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert_eq!(
+            peak_data_controlled(&[0.1; 512], 1, 2, Some(&cancelled)).unwrap_err(),
+            "Impor dibatalkan"
+        );
+    }
+
+    #[test]
+    fn denoise_profile_uses_longest_noise_only_clip_intersection() {
+        let clips = vec![
+            ClipSettings {
+                source_start: 10.0,
+                source_end: 20.0,
+                position: 0.0,
+                fade_in_seconds: 0.0,
+                fade_out_seconds: 0.0,
+                gain: 1.0,
+            },
+            ClipSettings {
+                source_start: 30.0,
+                source_end: 40.0,
+                position: 25.0,
+                fade_in_seconds: 0.0,
+                fade_out_seconds: 0.0,
+                gain: 1.0,
+            },
+        ];
+        assert_eq!(noise_profile_range(&clips, (2.0, 29.0)), Some((12.0, 20.0)));
+    }
+
+    #[test]
+    fn preview_effects_leave_unselected_audio_dry() {
+        let source = Arc::new(SampleBuffer::owned(vec![0.25; 1000]));
+        let settings = TrackSettings {
+            name: "preview".into(),
+            path: "preview.wav".into(),
+            gain: 1.0,
+            pan: 0.0,
+            mute: false,
+            solo: false,
+            rumble_cutoff_hz: 10.0,
+            rumble_bypass: false,
+            hum_frequency_hz: 50,
+            hum_bypass: true,
+            gate_threshold_db: -45.0,
+            gate_bypass: true,
+            denoise_reduction_db: 12.0,
+            denoise_bypass: true,
+            denoise_profile_range: None,
+            clips: vec![ClipSettings {
+                source_start: 0.0,
+                source_end: 1.0,
+                position: 0.0,
+                fade_in_seconds: 0.0,
+                fade_out_seconds: 0.0,
+                gain: 1.0,
+            }],
+        };
+        let processed_regions = process_effects_in_preview(
+            &source,
+            1,
+            1000,
+            &settings,
+            &settings.clips,
+            (0.4, 0.45),
+            None,
+        )
+        .unwrap();
+        let track = PreparedTrack {
+            source_index: 0,
+            samples: source,
+            processed_regions,
+            preview_range: Some((0.4, 0.45)),
+            channels: 1,
+            sample_rate: 1000,
+            gain_left: 1.0,
+            gain_right: 1.0,
+            clips: settings.clips,
+        };
+        assert_eq!(track.sample(100, 0, 0.1), 0.25);
+        assert!((track.sample(420, 0, 0.42) - 0.25).abs() > 0.001);
+        assert_eq!(track.sample(420, 0, 0.6), 0.25);
+    }
+
+    #[test]
+    fn streaming_pre_effect_cache_matches_reference_filters() {
+        let channels = 2;
+        let sample_rate = 48_000;
+        let directory = std::env::temp_dir().join(format!(
+            "izotay-pre-effect-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("source.wav");
+        std::fs::write(&source_path, b"cache identity fixture").unwrap();
+        let source = (0..(8193 * channels))
+            .map(|index| {
+                let frame = index / channels;
+                let tone = (frame as f32 * 0.037).sin() * 0.35;
+                if frame % 997 < 120 {
+                    tone * 0.025
+                } else {
+                    tone
+                }
+            })
+            .collect::<Vec<_>>();
+        let settings = TrackSettings {
+            name: "test".into(),
+            path: source_path.display().to_string(),
+            gain: 1.0,
+            pan: 0.0,
+            mute: false,
+            solo: false,
+            rumble_cutoff_hz: 85.0,
+            rumble_bypass: false,
+            hum_frequency_hz: 50,
+            hum_bypass: false,
+            gate_threshold_db: -42.0,
+            gate_bypass: false,
+            denoise_reduction_db: 12.0,
+            denoise_bypass: true,
+            denoise_profile_range: None,
+            clips: Vec::new(),
+        };
+        let expected =
+            process_pre_denoise(&source, channels, sample_rate, &settings, None).unwrap();
+        let source = Arc::new(SampleBuffer::owned(source));
+        let actual = cached_pre_effect_samples(
+            &source_path,
+            &source,
+            channels,
+            sample_rate,
+            &settings,
+            None,
+        )
+        .unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+        }
+        #[cfg(target_endian = "little")]
+        assert!(matches!(&actual.storage, SampleStorage::Mapped(_)));
+        let reopened = cached_pre_effect_samples(
+            &source_path,
+            &source,
+            channels,
+            sample_rate,
+            &settings,
+            None,
+        )
+        .unwrap();
+        assert_eq!(&actual[..], &reopened[..]);
+        let cache_path =
+            pre_effect_cache_path(&source_path, sample_rate, channels, &settings).unwrap();
+        drop(reopened);
+        drop(actual);
+        std::fs::remove_file(cache_path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sample_cache_pruning_keeps_recent_protected_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "izotay-cache-prune-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let old = directory.join("old.f32");
+        let recent = directory.join("recent.f32");
+        let orphaned = directory.join("orphaned.tmp");
+        std::fs::write(&old, [0u8; 8]).unwrap();
+        std::fs::write(&recent, [0u8; 8]).unwrap();
+        std::fs::write(&orphaned, [0u8; 8]).unwrap();
+        let old_file = std::fs::File::open(&old).unwrap();
+        old_file
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+        let orphaned_file = std::fs::File::open(&orphaned).unwrap();
+        orphaned_file
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60),
+            ))
+            .unwrap();
+        prune_sample_cache_with_limit(&directory, &recent, 8);
+        assert!(!old.exists());
+        assert!(!orphaned.exists());
+        assert!(recent.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn wav_reader_maps_pcm_and_float_sources() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let variants = [
+            (hound::SampleFormat::Int, 16),
+            (hound::SampleFormat::Int, 24),
+            (hound::SampleFormat::Int, 32),
+            (hound::SampleFormat::Float, 32),
+        ];
+        for (sample_format, bits_per_sample) in variants {
+            let path =
+                std::env::temp_dir().join(format!("izotay-wav-{}-{nonce}.wav", bits_per_sample));
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: 44_100,
+                bits_per_sample,
+                sample_format,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            match sample_format {
+                hound::SampleFormat::Int if bits_per_sample == 16 => {
+                    for value in [-16_384i16, 16_384, 0, i16::MIN, i16::MAX, 0] {
+                        writer.write_sample(value).unwrap();
+                    }
+                }
+                hound::SampleFormat::Int if bits_per_sample == 24 => {
+                    for value in [-4_194_304i32, 4_194_304, 0, -8_388_608, 8_388_607, 0] {
+                        writer.write_sample(value).unwrap();
+                    }
+                }
+                hound::SampleFormat::Int => {
+                    for value in [-1_073_741_824i32, 1_073_741_824, 0, i32::MIN, i32::MAX, 0] {
+                        writer.write_sample(value).unwrap();
+                    }
+                }
+                hound::SampleFormat::Float => {
+                    for value in [-0.5f32, 0.5, 0.0, -1.2, 1.2, 0.0] {
+                        writer.write_sample(value).unwrap();
+                    }
+                }
+            }
+            writer.finalize().unwrap();
+            let decoded = read_wav(&path).unwrap();
+            let cache_path = source_sample_cache_path(&path, 44_100, 2).unwrap();
+            assert_eq!(decoded.sample_rate, 44_100);
+            assert_eq!(decoded.channels, 2);
+            assert_eq!(decoded.samples.len(), 6);
+            #[cfg(target_endian = "little")]
+            assert!(matches!(&decoded.samples.storage, SampleStorage::Mapped(_)));
+            if matches!(sample_format, hound::SampleFormat::Float) {
+                assert_eq!(decoded.samples[3], -1.0);
+                assert_eq!(decoded.samples[4], 1.0);
+            }
+            let reopened = read_wav(&path).unwrap();
+            assert_eq!(&decoded.samples[..], &reopened.samples[..]);
+            drop(reopened);
+            drop(decoded);
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(cache_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn ffmpeg_denoise_streams_to_file_backed_cache() {
+        let Ok(filters) = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-filters"])
+            .output()
+        else {
+            return;
+        };
+        if !String::from_utf8_lossy(&filters.stdout).contains("afftdn") {
+            return;
+        }
+        let samples = (0..4800)
+            .map(|index| {
+                (std::f32::consts::TAU * 440.0 * index as f32 / 48_000.0).sin() * 0.2
+                    + if index % 2 == 0 { 0.01 } else { -0.01 }
+            })
+            .collect::<Vec<_>>();
+        let directory = std::env::temp_dir().join(format!(
+            "izotay-denoise-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let denoised =
+            cached_denoise_samples_controlled(&directory, &samples, 1, 48_000, 12.0, None, None)
+                .unwrap();
+        assert_eq!(denoised.len(), samples.len());
+        assert!(denoised.iter().all(|sample| sample.is_finite()));
+        #[cfg(target_endian = "little")]
+        assert!(matches!(&denoised.storage, SampleStorage::Mapped(_)));
+        let reopened =
+            cached_denoise_samples_controlled(&directory, &samples, 1, 48_000, 12.0, None, None)
+                .unwrap();
+        assert_eq!(&denoised[..], &reopened[..]);
+        let cache_path = denoise_cache_path(&directory, 48_000, 1, 12.0, None);
+        drop(reopened);
+        drop(denoised);
+        std::fs::remove_file(cache_path).unwrap();
+    }
+
+    #[test]
+    fn ffmpeg_import_streams_non_wav_media_into_reusable_cache() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("izotay-import-{nonce}.flac"));
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.1:sample_rate=44100",
+                "-ac",
+                "1",
+                "-c:a",
+                "flac",
+            ])
+            .arg(&path)
+            .status();
+        if !status.is_ok_and(|status| status.success()) {
+            return;
+        }
+        let cache_path = source_sample_cache_path(&path, 48_000, 2).unwrap();
+        let decoded = read_media_audio(&path).unwrap();
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 2);
+        assert!(!decoded.samples.is_empty());
+        let reopened = read_media_audio(&path).unwrap();
+        assert_eq!(&decoded.samples[..], &reopened.samples[..]);
+        #[cfg(target_endian = "little")]
+        assert!(matches!(
+            &reopened.samples.storage,
+            SampleStorage::Mapped(_)
+        ));
+        drop(reopened);
+        drop(decoded);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(cache_path).unwrap();
+    }
+
+    #[test]
     fn earlier_session_shape_defaults_new_fields() {
         let track: TrackSettings = serde_json::from_str(
             r#"{"name":"Host","path":"host.wav","gain":1.0,"pan":0.0,"mute":false,"solo":false,"clips":[]}"#,
@@ -5015,6 +5893,57 @@ mod tests {
             serde_json::from_str(r#"{"format_version":1,"sample_rate":48000,"tracks":[]}"#)
                 .unwrap();
         assert!(session.markers.is_empty());
+    }
+
+    #[test]
+    fn saved_session_roundtrips_media_effect_ranges() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("izotay-session-{nonce}.izotay"));
+        let mut app = App::default();
+        app.tracks.push(Track {
+            settings: TrackSettings {
+                name: "dialog".into(),
+                path: "/media/dialog.wav".into(),
+                gain: 1.0,
+                pan: 0.0,
+                mute: false,
+                solo: false,
+                rumble_cutoff_hz: 80.0,
+                rumble_bypass: false,
+                hum_frequency_hz: 50,
+                hum_bypass: true,
+                gate_threshold_db: -45.0,
+                gate_bypass: true,
+                denoise_reduction_db: 15.0,
+                denoise_bypass: false,
+                denoise_profile_range: Some((1.25, 2.75)),
+                clips: vec![ClipSettings {
+                    source_start: 0.0,
+                    source_end: 4.0,
+                    position: 0.0,
+                    fade_in_seconds: 0.0,
+                    fade_out_seconds: 0.0,
+                    gain: 1.0,
+                }],
+            },
+            audio: Audio {
+                samples: Arc::new(SampleBuffer::owned(vec![0.1; 8])),
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            waveform: Arc::new(WaveformCache::default()),
+            offline: false,
+        });
+        app.write_session_to(&path).unwrap();
+        let session: SessionFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(session.format_version, 14);
+        assert_eq!(session.tracks.len(), 1);
+        assert_eq!(session.tracks[0].denoise_profile_range, Some((1.25, 2.75)));
+        drop(app);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -5045,11 +5974,72 @@ mod tests {
         };
         write_mix_wav_24(&playback, &path).unwrap();
         let decoded = read_wav(&path).unwrap();
+        let cache_path = source_sample_cache_path(&path, 2, 2).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(decoded.channels, 2);
         assert_eq!(decoded.sample_rate, 2);
         for (actual, expected) in decoded.samples.iter().zip([0.5, -0.5, 0.25, -0.25]) {
             assert!((*actual - expected).abs() < 0.000001);
+        }
+        drop(decoded);
+        std::fs::remove_file(cache_path).unwrap();
+    }
+
+    #[test]
+    fn wav_export_supports_all_rates_and_pcm_depths() {
+        let playback = MixPlayback {
+            tracks: vec![PreparedTrack {
+                source_index: 0,
+                samples: Arc::new(SampleBuffer::owned(vec![0.25, -0.25, 0.5, -0.5])),
+                processed_regions: Vec::new(),
+                preview_range: None,
+                channels: 2,
+                sample_rate: 2,
+                gain_left: 1.0,
+                gain_right: 1.0,
+                clips: vec![ClipSettings {
+                    source_start: 0.0,
+                    source_end: 1.0,
+                    position: 0.0,
+                    fade_in_seconds: 0.0,
+                    fade_out_seconds: 0.0,
+                    gain: 1.0,
+                }],
+            }],
+            sample_rate: 2,
+            frames: 2,
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        for sample_rate in [44_100, 48_000, 96_000, 192_000] {
+            for bit_depth in [16, 24, 32] {
+                let path = std::env::temp_dir().join(format!(
+                    "izotay-export-{sample_rate}-{bit_depth}-{nonce}.wav"
+                ));
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                let (progress, _updates) = std::sync::mpsc::channel();
+                write_mix_wav_controlled(
+                    &playback,
+                    &path,
+                    ExportSettings {
+                        sample_rate,
+                        bit_depth,
+                        range: None,
+                        normalize_peak: false,
+                    },
+                    &cancel,
+                    &progress,
+                )
+                .unwrap();
+                let reader = hound::WavReader::open(&path).unwrap();
+                assert_eq!(reader.spec().sample_rate, sample_rate);
+                assert_eq!(reader.spec().bits_per_sample, bit_depth);
+                assert_eq!(reader.spec().channels, 2);
+                drop(reader);
+                std::fs::remove_file(path).unwrap();
+            }
         }
     }
 
