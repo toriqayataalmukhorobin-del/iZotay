@@ -1,6 +1,6 @@
 # Editor Multi-track — Keputusan Teknis
 
-Status: implementasi Tahap 2 untuk pipeline media panjang selesai: sumber dan hasil DSP diproses bertahap ke cache file-backed, dengan waveform multi-resolusi. Aplikasi tetap prototipe sampai validasi media nyata dan lintas sistem operasi selesai.
+Status: implementasi Tahap 3 selesai: spectrogram timeline, perbaikan klik/clipping terisolasi, de-esser, penekan tail reverb, dan otomasi gain tersimpan dalam sesi versi 15. Tahap ini menambah kemampuan prototipe; validasi hasil pada rekaman dialog nyata serta Windows/macOS masih diperlukan sebelum rilis.
 
 ## Pilihan prototipe
 
@@ -19,9 +19,11 @@ Status: implementasi Tahap 2 untuk pipeline media panjang selesai: sumber dan ha
 - Zoom timeline horizontal dapat diatur dari 25 hingga 400 piksel per detik; posisi playhead, marker, seleksi, dan drag klip mengikuti skala yang sama. Pengaturan zoom disimpan per sesi.
 - Tinggi lane waveform dapat diatur dari 52 hingga 220 piksel; pilihan disimpan per sesi.
 - Waveform memakai cache puncak multi-resolusi berbasis jendela 256 frame, dengan level kasar berlipat dua; cache disimpan di direktori sementara berdasarkan path, ukuran, waktu modifikasi, sample rate, dan kanal media. Level serta area gambar dipilih menurut zoom dan viewport agar klip panjang tidak menggambar titik di luar layar.
+- Spectrogram memakai FFT radix-2 512 sampel, Hann window, 64 pita hingga sekitar 6 kHz pada sumber 48 kHz, dan maksimum 30.000 kolom per track. Hasil disimpan ringkas di memori saat impor/pembukaan sesi dan dapat dipilih sebagai tampilan timeline.
 - Ruler waktu menampilkan label dan garis panduan dengan interval yang menyesuaikan zoom horizontal.
 - Snap opsional saat memindahkan klip mengunci tepi klip ke playhead, marker, tepi klip lain, atau grid waktu 0,1/0,25/0,5/1/2 detik dalam jarak 8 piksel; pengaturan disimpan per sesi.
 - Gain klip 0–4× dan fade in/out linear non-destruktif; parameter tersimpan di sesi, dapat di-undo, serta dipakai untuk playback, meter track, dan ekspor. Klip hasil split mewarisi gain.
+- Otomasi gain memakai titik waktu timeline dengan rentang gain 0–4×, interpolasi linear, default 1× sebelum titik pertama, dan nilai titik terakhir setelahnya. Titik dapat ditambah pada playhead atau dihapus dari titik terdekat; garis dan titik tampak di klip, tersimpan dalam sesi, di-undo, dan dipakai playback/meter/ekspor.
 - Crossfade dapat dibuat untuk klip terpilih yang overlap dengan klip setelahnya; fade out/in diselaraskan ke rentang overlap dan dapat di-undo.
 - Seleksi rentang waktu lewat seret pada area kosong timeline atau Shift+seret klip; rentang dapat di-loop untuk preview dan dipakai untuk ekspor mix atau track.
 - Mode preview seleksi opsional membatasi render efek pada sumber yang beririsan dengan rentang timeline terpilih; rentang lain tetap memakai audio asli dan ekspor tetap memproses efek seluruh track.
@@ -33,10 +35,12 @@ Status: implementasi Tahap 2 untuk pipeline media panjang selesai: sumber dan ha
 - High-pass rumble per track dengan rentang 0–180 Hz dan bypass untuk perbandingan cepat; pemrosesan per frame memakai state filter berkelanjutan dan cache hasil.
 - Hum removal per track dengan pilihan listrik 50/60 Hz, notch sempit pada fundamental dan sampai delapan harmonik, serta bypass.
 - Denoise spektral per track melalui FFmpeg `afftdn`, pengurangan 0–30 dB, bypass, A/B, dan rentang profil noise dari bagian seleksi yang hanya berisi noise latar; input serta keluaran full-track dialirkan bertahap, sumber tetap utuh.
-- Perbandingan A/B untuk parameter rumble, hum, expander, dan denoise per track; set A tersimpan dalam sesi sementara kontrol tetap mengedit set B.
+- Perbandingan A/B untuk parameter rumble, hum, expander, denoise, de-click, de-clip, de-esser, dan de-reverb per track; set A tersimpan dalam sesi sementara kontrol tetap mengedit set B.
 - Expander per track dengan threshold -60 hingga -20 dBFS, bypass, penurunan level konservatif sekitar 15 dB, attack 10 ms, dan release 120 ms; envelope dipertahankan antar-frame saat hasil ditulis ke cache.
+- De-click mendeteksi transien satu sampel yang menyimpang kuat dari tetangga lalu menginterpolasi nilainya; de-clip mencari plateau sampel yang mencapai ±0,985 dan menginterpolasi rentang terpotong hingga 64 frame. Keduanya non-destruktif dan ikut cache DSP.
+- De-esser memakai high-pass satu kutub sekitar 5,5 kHz, envelope attack 3 ms/release 45 ms, threshold −60–0 dBFS, serta reduksi maksimum 0–18 dB. De-reverb adalah penekan tail berbasis envelope level rendah dengan release 350 ms dan intensitas 0–100%; bukan pemisah reverberasi berbasis model.
 - Meter peak master live menampilkan level linear dan dBFS dari callback output; meter per track menunjukkan peak pada jendela 10 ms di sekitar playhead.
-- Simpan/buka sesi `.izotay` versi 14; versi 1–13 tetap dibaca. Gain klip baru memakai default 1×, zoom memakai nilai default, snap nonaktif, dan tinggi lane memakai nilai default pada sesi lama. Rentang profil noise, pengaturan ekspor, dan set A ikut disimpan. Sumber media direferensikan lewat path, bukan disalin ke sesi.
+- Simpan/buka sesi `.izotay` versi 15; versi 1–14 tetap dibaca. Kolom efek Tahap 3 dan otomasi memakai default aman ketika tidak ada pada sesi lama. Gain klip baru memakai default 1×, zoom memakai nilai default, snap nonaktif, dan tinggi lane memakai nilai default pada sesi lama. Rentang profil noise, pengaturan ekspor, dan set A ikut disimpan. Sumber media direferensikan lewat path, bukan disalin ke sesi.
 - Sesi tetap dapat dibuka saat sumber tidak tersedia; track ditandai offline dan dapat ditautkan ulang lewat dialog file. Klip yang melewati durasi sumber baru dipangkas ke rentang valid.
 - Mix menggunakan sample rate track pertama; sumber dan playback perangkat memakai interpolasi linear saat menyamakan laju sampel.
 
@@ -49,13 +53,14 @@ Status: implementasi Tahap 2 untuk pipeline media panjang selesai: sumber dan ha
 - Normalisasi mengukur peak sample pada rentang ekspor, bukan loudness LUFS; boost dibatasi 40 dB agar rekaman sangat pelan tidak dinaikkan tanpa batas.
 - Notch hum dapat mengurangi komponen suara yang kebetulan berada dekat harmoniknya; bypass tersedia, dan hasil tetap perlu didengar pada rekaman sasaran.
 - Denoise memerlukan build FFmpeg dengan filter `afftdn`; satu rentang noise-only terpanjang dari seleksi dipakai untuk sampling profil setiap kali mix dirender, lalu pemrosesan diterapkan pada seluruh track. Expander perlu diuji pada dialog pelan sebelum dipakai di produksi.
+- Spectrogram hanya visual dan belum mendukung seleksi/penghapusan frekuensi dengan kuas. De-click/de-clip menangani transien dan plateau pendek, sedangkan kasus restorasi kompleks dapat memerlukan editor khusus. De-reverb merupakan pengurangan tail berbasis level sehingga setelan terlalu kuat bisa menekan dialog pelan.
 - Playback menghitung mix per frame di callback audio dan tidak menyimpan buffer mix penuh. Sumber dan hasil efek full-track memakai pemetaan cache file; daftar klip yang sangat padat dapat menambah beban callback.
 - Preview gambar video belum tersedia. Loop hanya mengulang rentang waktu yang dipilih. Mode preview seleksi menyimpan hasil efek pada rentang terpilih beserta konteks 250 ms di memori agar filter stabil; seleksi yang sangat panjang dapat memakai RAM besar. Ekspor selalu merender efek pada seluruh track dan memakai cache file-backed.
 - Meter live master dibaca dari callback output; meter track menampilkan peak pada jendela 10 ms di sekitar playhead.
 - Batas loop belum memakai crossfade; pilih rentang dengan transisi yang bersih untuk menghindari klik.
 - Relink memangkas klip yang sumbernya melebihi durasi berkas yang dipilih; kecocokan identitas media belum diverifikasi otomatis.
 - Penggantian file sesi memakai file sementara dan cadangan agar dapat berjalan pada sistem yang tidak mendukung rename langsung di atas file yang ada.
-- `cargo test` (21 test), `cargo check`, build debug, Clippy dengan warning sebagai error, dan `git diff --check` bersih. Tes mencakup WAV PCM 16/24/32-bit dan float, impor FFmpeg non-WAV, alur WAV impor-filter-mix-ekspor-impor, seluruh sample rate/bit depth ekspor, resampling, roundtrip sesi, preview/profil noise, pruning cache, kesetaraan DSP bertahap, serta FFmpeg denoise bila tersedia. Uji alur UI pada rekaman dialog nyata dan hasil CI Windows/macOS masih perlu ditinjau.
+- Tes lokal mencakup WAV PCM 16/24/32-bit dan float, impor FFmpeg non-WAV, alur WAV impor-filter-mix-ekspor-impor, seluruh sample rate/bit depth ekspor, resampling, roundtrip/migrasi sesi, preview/profil noise, pruning cache, kesetaraan DSP bertahap, spectrogram, empat restorasi Tahap 3, dan FFmpeg denoise bila tersedia. Uji alur UI pada rekaman dialog nyata dan hasil CI Windows/macOS masih perlu ditinjau.
 
 ## Validasi sebelum rilis
 

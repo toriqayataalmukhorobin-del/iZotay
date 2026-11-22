@@ -93,6 +93,7 @@ struct PreparedTrack {
     sample_rate: u32,
     gain_left: f32,
     gain_right: f32,
+    automation: Vec<GainPoint>,
     clips: Vec<ClipSettings>,
 }
 struct ProcessedRegion {
@@ -176,8 +177,9 @@ impl MixPlayback {
                 };
                 let left = sample(0);
                 let right = if track.channels == 1 { left } else { sample(1) };
-                output[0] += left * track.gain_left * clip.gain * fade_gain;
-                output[1] += right * track.gain_right * clip.gain * fade_gain;
+                let automation_gain = gain_at_time(&track.automation, time);
+                output[0] += left * track.gain_left * clip.gain * fade_gain * automation_gain;
+                output[1] += right * track.gain_right * clip.gain * fade_gain * automation_gain;
             }
         }
         output
@@ -229,8 +231,9 @@ impl MixPlayback {
             let fade = fade_in.min(fade_out);
             let left = sample(0);
             let right = if track.channels == 1 { left } else { sample(1) };
-            output[0] += left * track.gain_left * clip.gain * fade;
-            output[1] += right * track.gain_right * clip.gain * fade;
+            let automation_gain = gain_at_time(&track.automation, time);
+            output[0] += left * track.gain_left * clip.gain * fade * automation_gain;
+            output[1] += right * track.gain_right * clip.gain * fade * automation_gain;
         }
         output[0].abs().max(output[1].abs()).min(1.0)
     }
@@ -499,6 +502,22 @@ struct TrackSettings {
     #[serde(default)]
     denoise_profile_range: Option<(f64, f64)>,
     #[serde(default)]
+    declick_enabled: bool,
+    #[serde(default)]
+    declip_enabled: bool,
+    #[serde(default)]
+    deesser_enabled: bool,
+    #[serde(default = "default_deesser_threshold")]
+    deesser_threshold_db: f32,
+    #[serde(default = "default_deesser_reduction")]
+    deesser_reduction_db: f32,
+    #[serde(default)]
+    dereverb_enabled: bool,
+    #[serde(default = "default_dereverb_amount")]
+    dereverb_amount: f32,
+    #[serde(default)]
+    gain_automation: Vec<GainPoint>,
+    #[serde(default)]
     clips: Vec<ClipSettings>,
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -515,6 +534,20 @@ struct EffectSettings {
     denoise_bypass: bool,
     #[serde(default)]
     denoise_profile_range: Option<(f64, f64)>,
+    #[serde(default)]
+    declick_enabled: bool,
+    #[serde(default)]
+    declip_enabled: bool,
+    #[serde(default)]
+    deesser_enabled: bool,
+    #[serde(default = "default_deesser_threshold")]
+    deesser_threshold_db: f32,
+    #[serde(default = "default_deesser_reduction")]
+    deesser_reduction_db: f32,
+    #[serde(default)]
+    dereverb_enabled: bool,
+    #[serde(default = "default_dereverb_amount")]
+    dereverb_amount: f32,
 }
 impl TrackSettings {
     fn effect_settings(&self) -> EffectSettings {
@@ -528,6 +561,13 @@ impl TrackSettings {
             denoise_reduction_db: self.denoise_reduction_db,
             denoise_bypass: self.denoise_bypass,
             denoise_profile_range: self.denoise_profile_range,
+            declick_enabled: self.declick_enabled,
+            declip_enabled: self.declip_enabled,
+            deesser_enabled: self.deesser_enabled,
+            deesser_threshold_db: self.deesser_threshold_db,
+            deesser_reduction_db: self.deesser_reduction_db,
+            dereverb_enabled: self.dereverb_enabled,
+            dereverb_amount: self.dereverb_amount,
         }
     }
     fn apply_effect_settings(&mut self, effects: &EffectSettings) {
@@ -540,7 +580,39 @@ impl TrackSettings {
         self.denoise_reduction_db = effects.denoise_reduction_db;
         self.denoise_bypass = effects.denoise_bypass;
         self.denoise_profile_range = effects.denoise_profile_range;
+        self.declick_enabled = effects.declick_enabled;
+        self.declip_enabled = effects.declip_enabled;
+        self.deesser_enabled = effects.deesser_enabled;
+        self.deesser_threshold_db = effects.deesser_threshold_db;
+        self.deesser_reduction_db = effects.deesser_reduction_db;
+        self.dereverb_enabled = effects.dereverb_enabled;
+        self.dereverb_amount = effects.dereverb_amount;
     }
+}
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct GainPoint {
+    time: f64,
+    gain: f32,
+}
+fn gain_at_time(points: &[GainPoint], time: f64) -> f32 {
+    if points.is_empty() {
+        return 1.0;
+    }
+    let upper = points.partition_point(|point| point.time <= time);
+    if upper == 0 {
+        return 1.0;
+    }
+    if upper >= points.len() {
+        return points[points.len() - 1].gain;
+    }
+    let left = &points[upper - 1];
+    let right = &points[upper];
+    let span = right.time - left.time;
+    if span <= 0.0 {
+        return right.gain;
+    }
+    let amount = ((time - left.time) / span).clamp(0.0, 1.0) as f32;
+    left.gain + (right.gain - left.gain) * amount
 }
 #[derive(Serialize, Deserialize)]
 struct SessionFile {
@@ -683,6 +755,7 @@ struct Track {
     settings: TrackSettings,
     audio: Audio,
     waveform: Arc<WaveformCache>,
+    spectrogram: Arc<SpectrogramCache>,
     offline: bool,
 }
 #[derive(Clone, Default)]
@@ -693,6 +766,84 @@ struct WaveformCache {
 struct PeakLevel {
     window_frames: usize,
     peaks: Vec<f32>,
+}
+#[derive(Clone, Default)]
+struct SpectrogramCache {
+    hop_frames: usize,
+    columns: Vec<Vec<u8>>,
+}
+fn build_spectrogram(samples: &[f32], channels: usize, sample_rate: u32) -> SpectrogramCache {
+    const WINDOW: usize = 512;
+    const BINS: usize = 64;
+    if channels == 0 || sample_rate == 0 || samples.len() < WINDOW * channels {
+        return SpectrogramCache::default();
+    }
+    let frames = samples.len() / channels;
+    let hop = (frames.div_ceil(30_000)).max(WINDOW);
+    let mut columns = Vec::with_capacity(frames.div_ceil(hop));
+    let mut real = vec![0.0f32; WINDOW];
+    let mut imag = vec![0.0f32; WINDOW];
+    let window_norm = (WINDOW - 1) as f32;
+    for start in (0..frames.saturating_sub(WINDOW) + 1).step_by(hop) {
+        for index in 0..WINDOW {
+            let sample = (0..channels)
+                .map(|channel| samples[(start + index) * channels + channel])
+                .sum::<f32>()
+                / channels as f32;
+            real[index] =
+                sample * (0.5 - 0.5 * (std::f32::consts::TAU * index as f32 / window_norm).cos());
+            imag[index] = 0.0;
+        }
+        fft_in_place(&mut real, &mut imag);
+        let mut column = vec![0u8; BINS];
+        for (bin, magnitude) in column.iter_mut().enumerate() {
+            let amplitude = (real[bin].hypot(imag[bin]) / WINDOW as f32).max(1e-7);
+            let db = (20.0 * amplitude.log10()).clamp(-72.0, 0.0);
+            *magnitude = ((db + 72.0) * (255.0 / 72.0)) as u8;
+        }
+        columns.push(column);
+    }
+    SpectrogramCache {
+        hop_frames: hop,
+        columns,
+    }
+}
+fn fft_in_place(real: &mut [f32], imag: &mut [f32]) {
+    let length = real.len();
+    let mut j = 0usize;
+    for i in 1..length {
+        let mut bit = length >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            real.swap(i, j);
+            imag.swap(i, j);
+        }
+    }
+    let mut size = 2;
+    while size <= length {
+        let angle = -std::f32::consts::TAU / size as f32;
+        let (sin_step, cos_step) = angle.sin_cos();
+        for block in (0..length).step_by(size) {
+            let mut wr = 1.0f32;
+            let mut wi = 0.0f32;
+            for offset in 0..size / 2 {
+                let even = block + offset;
+                let odd = even + size / 2;
+                let tr = wr * real[odd] - wi * imag[odd];
+                let ti = wr * imag[odd] + wi * real[odd];
+                real[odd] = real[even] - tr;
+                imag[odd] = imag[even] - ti;
+                real[even] += tr;
+                imag[even] += ti;
+                (wr, wi) = (wr * cos_step - wi * sin_step, wr * sin_step + wi * cos_step);
+            }
+        }
+        size <<= 1;
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Marker {
@@ -728,7 +879,7 @@ struct ImportResult {
 struct RelinkResult {
     track_index: usize,
     path: std::path::PathBuf,
-    result: Result<(Audio, Arc<WaveformCache>), String>,
+    result: Result<(Audio, Arc<WaveformCache>, Arc<SpectrogramCache>), String>,
 }
 struct LoadedSession {
     tracks: Vec<Track>,
@@ -873,6 +1024,8 @@ struct App {
     snap_grid_enabled: bool,
     snap_grid_interval: f64,
     timeline_track_height: f32,
+    spectrogram_view: bool,
+    automation_gain_value: f32,
     preview_selection_only: bool,
     mix_preview_range: Option<(f64, f64)>,
     time_selection: Option<(f64, f64)>,
@@ -925,6 +1078,8 @@ impl Default for App {
             snap_grid_enabled: false,
             snap_grid_interval: default_snap_grid_interval(),
             timeline_track_height: default_timeline_track_height(),
+            spectrogram_view: false,
+            automation_gain_value: 1.0,
             preview_selection_only: false,
             mix_preview_range: None,
             time_selection: None,
@@ -1190,7 +1345,12 @@ impl App {
                             audio.sample_rate,
                             None,
                         )?;
-                        Ok((audio, waveform))
+                        let spectrogram = Arc::new(build_spectrogram(
+                            &audio.samples,
+                            audio.channels as usize,
+                            audio.sample_rate,
+                        ));
+                        Ok((audio, waveform, spectrogram))
                     });
                     let _ = sender.send(RelinkResult {
                         track_index: index,
@@ -1219,7 +1379,7 @@ impl App {
             self.relink_result = None;
             self.relink_in_progress = false;
             match result.result {
-                Ok((audio, waveform)) if result.track_index < self.tracks.len() => {
+                Ok((audio, waveform, spectrogram)) if result.track_index < self.tracks.len() => {
                     self.checkpoint();
                     let track = &mut self.tracks[result.track_index];
                     let source_duration = audio.samples.len() as f64
@@ -1242,6 +1402,7 @@ impl App {
                     );
                     track.settings.path = result.path.display().to_string();
                     track.waveform = waveform;
+                    track.spectrogram = spectrogram;
                     track.audio = audio;
                     track.offline = false;
                     if let Some(effect) = self
@@ -1494,6 +1655,11 @@ impl App {
                                         continue;
                                     }
                                 };
+                                let spectrogram = Arc::new(build_spectrogram(
+                                    &audio.samples,
+                                    audio.channels as usize,
+                                    audio.sample_rate,
+                                ));
                                 result.tracks.push(Track {
                                     settings: TrackSettings {
                                         name,
@@ -1511,6 +1677,14 @@ impl App {
                                         denoise_reduction_db: default_denoise_reduction(),
                                         denoise_bypass: true,
                                         denoise_profile_range: None,
+                                        declick_enabled: false,
+                                        declip_enabled: false,
+                                        deesser_enabled: false,
+                                        deesser_threshold_db: default_deesser_threshold(),
+                                        deesser_reduction_db: default_deesser_reduction(),
+                                        dereverb_enabled: false,
+                                        dereverb_amount: default_dereverb_amount(),
+                                        gain_automation: Vec::new(),
                                         clips: vec![ClipSettings {
                                             source_start: 0.0,
                                             source_end: duration,
@@ -1521,6 +1695,7 @@ impl App {
                                         }],
                                     },
                                     waveform,
+                                    spectrogram,
                                     audio,
                                     offline: false,
                                 });
@@ -1620,7 +1795,7 @@ impl App {
     }
     fn write_session_to(&self, path: &std::path::Path) -> Result<(), String> {
         let session = SessionFile {
-            format_version: 14,
+            format_version: 15,
             sample_rate: self
                 .tracks
                 .first()
@@ -1707,7 +1882,7 @@ impl App {
                             std::fs::read(&source_path).map_err(|error| error.to_string())?;
                         let mut session: SessionFile = serde_json::from_slice(&data)
                             .map_err(|error| format!("Sesi tidak valid: {error}"))?;
-                        if !(1..=14).contains(&session.format_version) {
+                        if !(1..=15).contains(&session.format_version) {
                             return Err(format!(
                                 "Versi sesi {} belum didukung",
                                 session.format_version
@@ -1756,6 +1931,28 @@ impl App {
                                     settings.name
                                 ));
                             }
+                            if !settings.deesser_threshold_db.is_finite()
+                                || !(-60.0..=0.0).contains(&settings.deesser_threshold_db)
+                                || !settings.deesser_reduction_db.is_finite()
+                                || !(0.0..=18.0).contains(&settings.deesser_reduction_db)
+                                || !settings.dereverb_amount.is_finite()
+                                || !(0.0..=1.0).contains(&settings.dereverb_amount)
+                                || settings.gain_automation.iter().any(|point| {
+                                    !point.time.is_finite()
+                                        || point.time < 0.0
+                                        || !point.gain.is_finite()
+                                        || !(0.0..=4.0).contains(&point.gain)
+                                })
+                            {
+                                return Err(format!(
+                                    "Pengaturan restorasi Tahap 3 track {:?} tidak valid",
+                                    settings.name
+                                ));
+                            }
+                            settings
+                                .gain_automation
+                                .sort_by(|a, b| a.time.total_cmp(&b.time));
+                            settings.gain_automation.dedup_by(|a, b| a.time == b.time);
                             if settings.denoise_profile_range.is_some_and(|(start, end)| {
                                 !start.is_finite()
                                     || !end.is_finite()
@@ -1833,6 +2030,11 @@ impl App {
                                     audio.sample_rate,
                                     None,
                                 )?,
+                                spectrogram: Arc::new(build_spectrogram(
+                                    &audio.samples,
+                                    audio.channels as usize,
+                                    audio.sample_rate,
+                                )),
                                 audio,
                                 settings,
                                 offline,
@@ -1852,6 +2054,12 @@ impl App {
                                     || !effect.gate_threshold_db.is_finite()
                                     || !effect.denoise_reduction_db.is_finite()
                                     || !(0.0..=30.0).contains(&effect.denoise_reduction_db)
+                                    || !effect.deesser_threshold_db.is_finite()
+                                    || !(-60.0..=0.0).contains(&effect.deesser_threshold_db)
+                                    || !effect.deesser_reduction_db.is_finite()
+                                    || !(0.0..=18.0).contains(&effect.deesser_reduction_db)
+                                    || !effect.dereverb_amount.is_finite()
+                                    || !(0.0..=1.0).contains(&effect.dereverb_amount)
                                     || effect.denoise_profile_range.is_some_and(|(start, end)| {
                                         !start.is_finite()
                                             || !end.is_finite()
@@ -2868,6 +3076,7 @@ impl eframe::App for App {
             }
             let mut view_settings_changed = false;
             ui.horizontal(|ui| {
+                view_settings_changed |= ui.checkbox(&mut self.spectrogram_view, "Spectrogram").changed();
                 ui.label("Zoom timeline");
                 view_settings_changed |= ui
                     .add(
@@ -2914,6 +3123,30 @@ impl eframe::App for App {
             if view_settings_changed {
                 self.last_edit = Some(std::time::Instant::now());
             }
+            ui.horizontal(|ui| {
+                ui.label("Otomasi gain");
+                ui.add(egui::Slider::new(&mut self.automation_gain_value, 0.0..=4.0).text("Gain titik ×"));
+                let add_point = ui.button("Tambah titik di playhead").clicked();
+                let remove_point = ui.button("Hapus titik terdekat").clicked();
+                ui.weak("Interpolasi linear; titik mengikuti waktu timeline.");
+                if add_point && self.selected_track.is_some()
+                    && let Some(track) = self.selected_track.and_then(|index| self.tracks.get_mut(index)) {
+                    track.settings.gain_automation.push(GainPoint { time: self.playhead_seconds.max(0.0), gain: self.automation_gain_value });
+                    track.settings.gain_automation.sort_by(|a, b| a.time.total_cmp(&b.time));
+                    track.settings.gain_automation.dedup_by(|a, b| a.time == b.time);
+                    changed = true;
+                    self.last_edit = Some(std::time::Instant::now());
+                }
+                if remove_point && self.selected_track.is_some()
+                    && let Some(track) = self.selected_track.and_then(|index| self.tracks.get_mut(index))
+                    && let Some((point_index, _)) = track.settings.gain_automation.iter().enumerate().min_by(|(_, a), (_, b)| {
+                        (a.time - self.playhead_seconds).abs().total_cmp(&(b.time - self.playhead_seconds).abs())
+                    }) {
+                    track.settings.gain_automation.remove(point_index);
+                    changed = true;
+                    self.last_edit = Some(std::time::Instant::now());
+                }
+            });
             let pixels_per_second = 100.0 * self.timeline_zoom;
             let snap_enabled = self.snap_enabled;
             let snap_grid_interval = self
@@ -2993,7 +3226,11 @@ impl eframe::App for App {
                             + usize::from(
                                 !track.settings.denoise_bypass
                                     && track.settings.denoise_reduction_db > 0.0,
-                            );
+                            )
+                            + usize::from(track.settings.declick_enabled)
+                            + usize::from(track.settings.declip_enabled)
+                            + usize::from(track.settings.deesser_enabled)
+                            + usize::from(track.settings.dereverb_enabled);
                         ui.collapsing(
                             format!("Restorasi · {active_restoration_count} aktif"),
                             |ui| {
@@ -3002,6 +3239,19 @@ impl eframe::App for App {
                             changed |= ui.checkbox(&mut track.settings.rumble_bypass, "Bypass").changed();
                             changed |= ui.add(egui::Slider::new(&mut track.settings.gate_threshold_db, -60.0..=-20.0).text("Expander dB")).changed();
                             changed |= ui.checkbox(&mut track.settings.gate_bypass, "Bypass expander").changed();
+                        });
+                        ui.horizontal(|ui| {
+                            changed |= ui.checkbox(&mut track.settings.declick_enabled, "De-click").on_hover_text("Mengganti lonjakan sampel terisolasi dengan interpolasi tetangga.").changed();
+                            changed |= ui.checkbox(&mut track.settings.declip_enabled, "De-clip").on_hover_text("Merekonstruksi sampel clipping yang terisolasi.").changed();
+                        });
+                        ui.horizontal(|ui| {
+                            changed |= ui.checkbox(&mut track.settings.deesser_enabled, "De-esser").changed();
+                            changed |= ui.add(egui::Slider::new(&mut track.settings.deesser_threshold_db, -60.0..=0.0).text("Ambang dBFS")).changed();
+                            changed |= ui.add(egui::Slider::new(&mut track.settings.deesser_reduction_db, 0.0..=18.0).text("Maks reduksi dB")).changed();
+                        });
+                        ui.horizontal(|ui| {
+                            changed |= ui.checkbox(&mut track.settings.dereverb_enabled, "De-reverb").changed();
+                            changed |= ui.add(egui::Slider::new(&mut track.settings.dereverb_amount, 0.0..=1.0).text("Reduksi tail")).changed();
                         });
                         ui.horizontal(|ui| {
                             changed |= egui::ComboBox::from_id_salt(("hum_frequency", index))
@@ -3396,6 +3646,47 @@ impl eframe::App for App {
                                             );
                                         }
                                     }
+                                    if self.spectrogram_view && !track.spectrogram.columns.is_empty() {
+                                        let x_start = visible_clip.left().max(clip_rect.left());
+                                        let x_end = visible_clip.right().min(clip_rect.right());
+                                        let mut x = x_start;
+                                        while x < x_end {
+                                            let timeline_time = clip.position + (x - left) as f64 / pixels_per_second as f64;
+                                            let source_time = clip.source_start + timeline_time - clip.position;
+                                            let frame = (source_time.max(0.0) * track.audio.sample_rate as f64) as usize;
+                                            let column_index = frame.checked_div(track.spectrogram.hop_frames).unwrap_or(0);
+                                            if let Some(column) = track.spectrogram.columns.get(column_index) {
+                                                for (bin, intensity) in column.iter().enumerate() {
+                                                    let strength = *intensity as f32 / 255.0;
+                                                    let color = egui::Color32::from_rgba_unmultiplied(
+                                                        (20.0 + strength * 185.0) as u8,
+                                                        (35.0 + strength * 175.0) as u8,
+                                                        (75.0 + strength * 160.0) as u8,
+                                                        155,
+                                                    );
+                                                    let bin_height = clip_rect.height() / column.len() as f32;
+                                                    let y = clip_rect.bottom() - (bin + 1) as f32 * bin_height;
+                                                    painter.rect_filled(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2((track.spectrogram.hop_frames.max(1) as f32 / track.audio.sample_rate.max(1) as f32 * pixels_per_second).max(1.0), bin_height + 0.5)), 0.0, color);
+                                                }
+                                            }
+                                            x += (track.spectrogram.hop_frames.max(1) as f32 / track.audio.sample_rate.max(1) as f32 * pixels_per_second).max(1.0);
+                                        }
+                                    }
+                                    if !track.settings.gain_automation.is_empty() {
+                                        let clip_start = clip.position;
+                                        let clip_end = clip.position + clip.source_end - clip.source_start;
+                                        let mut points = vec![(clip_start, gain_at_time(&track.settings.gain_automation, clip_start))];
+                                        points.extend(track.settings.gain_automation.iter().filter(|point| point.time > clip_start && point.time < clip_end).map(|point| (point.time, point.gain)));
+                                        points.push((clip_end, gain_at_time(&track.settings.gain_automation, clip_end)));
+                                        for pair in points.windows(2) {
+                                            let to_pos = |time: f64, gain: f32| egui::pos2(left + time as f32 * pixels_per_second, clip_rect.bottom() - (gain / 4.0).clamp(0.0, 1.0) * clip_rect.height());
+                                            painter.line_segment([to_pos(pair[0].0, pair[0].1), to_pos(pair[1].0, pair[1].1)], (2.0, egui::Color32::from_rgb(255, 220, 90)));
+                                        }
+                                        for (time, gain) in points {
+                                            let pos = egui::pos2(left + time as f32 * pixels_per_second, clip_rect.bottom() - (gain / 4.0).clamp(0.0, 1.0) * clip_rect.height());
+                                            painter.circle_filled(pos, 3.5, egui::Color32::from_rgb(255, 235, 130));
+                                        }
+                                    }
                                     let _ = clip_index;
                                 }
                             });
@@ -3497,6 +3788,16 @@ fn default_gate_threshold() -> f32 {
 
 fn default_denoise_reduction() -> f32 {
     12.0
+}
+
+fn default_deesser_threshold() -> f32 {
+    -24.0
+}
+fn default_deesser_reduction() -> f32 {
+    6.0
+}
+fn default_dereverb_amount() -> f32 {
+    0.35
 }
 
 fn default_hum_frequency() -> u32 {
@@ -3907,6 +4208,17 @@ fn process_pre_denoise(
     cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<f32>, String> {
     let mut output = samples.to_vec();
+    if settings.declick_enabled || settings.declip_enabled {
+        if channels == 0 || !samples.len().is_multiple_of(channels) {
+            return Err("Sumber audio tidak valid untuk perbaikan klik/clipping".into());
+        }
+        for frame in 0..samples.len() / channels {
+            for channel in 0..channels {
+                output[frame * channels + channel] =
+                    repair_sample(samples, frame, channel, channels, settings);
+            }
+        }
+    }
     if !settings.rumble_bypass && settings.rumble_cutoff_hz > 0.0 {
         output = highpass_samples_controlled(
             &output,
@@ -3935,6 +4247,144 @@ fn process_pre_denoise(
             cancelled,
         )?;
     }
+    let mut post_settings = settings.clone();
+    post_settings.declick_enabled = false;
+    post_settings.declip_enabled = false;
+    output = process_stage3_effects(&output, channels, sample_rate, &post_settings, cancelled)?;
+    Ok(output)
+}
+
+fn repair_sample(
+    samples: &[f32],
+    frame: usize,
+    channel: usize,
+    channels: usize,
+    settings: &TrackSettings,
+) -> f32 {
+    let frames = samples.len() / channels;
+    let index = frame * channels + channel;
+    let current = samples[index];
+    if settings.declip_enabled && current.abs() >= 0.985 {
+        let mut left = frame;
+        while left > 0
+            && frame - left < 64
+            && samples[(left - 1) * channels + channel].abs() >= 0.985
+        {
+            left -= 1;
+        }
+        let mut right = frame;
+        while right + 1 < frames
+            && right - frame < 64
+            && samples[(right + 1) * channels + channel].abs() >= 0.985
+        {
+            right += 1;
+        }
+        if left > 0 && right + 1 < frames {
+            let before = samples[(left - 1) * channels + channel];
+            let after = samples[(right + 1) * channels + channel];
+            let amount = (frame - left + 1) as f32 / (right - left + 2) as f32;
+            return before + (after - before) * amount;
+        }
+    }
+    let previous = if frame > 0 {
+        samples[index - channels]
+    } else {
+        current
+    };
+    let next = if frame + 1 < frames {
+        samples[index + channels]
+    } else {
+        current
+    };
+    if settings.declick_enabled
+        && (current - (previous + next) * 0.5).abs() > 0.32
+        && (current - previous).abs() > 0.32
+        && (current - next).abs() > 0.32
+    {
+        (previous + next) * 0.5
+    } else {
+        current
+    }
+}
+
+fn process_stage3_effects(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    settings: &TrackSettings,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<f32>, String> {
+    if !settings.declick_enabled
+        && !settings.declip_enabled
+        && !settings.deesser_enabled
+        && !settings.dereverb_enabled
+    {
+        return Ok(samples.to_vec());
+    }
+    if channels == 0 || sample_rate == 0 || !samples.len().is_multiple_of(channels) {
+        return Err("Sumber audio tidak valid untuk restorasi Tahap 3".into());
+    }
+    let frames = samples.len() / channels;
+    let mut output = samples.to_vec();
+    let mut high_state = vec![0.0f32; channels];
+    let mut high_band = vec![0.0f32; channels];
+    let mut deesser_env = 0.0f32;
+    let mut reverb_env = 0.0f32;
+    let alpha = (-std::f32::consts::TAU * 5_500.0 / sample_rate as f32).exp();
+    let attack = 1.0 - (-1.0 / (sample_rate as f32 * 0.003)).exp();
+    let release = 1.0 - (-1.0 / (sample_rate as f32 * 0.045)).exp();
+    let reverb_release = 1.0 - (-1.0 / (sample_rate as f32 * 0.35)).exp();
+    let deesser_threshold = 10.0f32.powf(settings.deesser_threshold_db.clamp(-60.0, 0.0) / 20.0);
+    let reduction = 1.0 - 10.0f32.powf(-settings.deesser_reduction_db.clamp(0.0, 18.0) / 20.0);
+    let reverb_amount = settings.dereverb_amount.clamp(0.0, 1.0);
+    for frame in 0..frames {
+        if frame % 16_384 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("Render mix dibatalkan".into());
+        }
+        for channel in 0..channels {
+            let index = frame * channels + channel;
+            let repaired = repair_sample(samples, frame, channel, channels, settings);
+            let low = alpha * high_state[channel] + (1.0 - alpha) * repaired;
+            let high = repaired - low;
+            high_state[channel] = low;
+            high_band[channel] = high;
+            output[index] = repaired;
+        }
+        let start = frame * channels;
+        let high_energy = (0..channels)
+            .map(|channel| high_band[channel].abs())
+            .fold(0.0f32, f32::max);
+        let coeff = if high_energy > deesser_env {
+            attack
+        } else {
+            release
+        };
+        deesser_env += (high_energy - deesser_env) * coeff;
+        if settings.deesser_enabled && deesser_env > deesser_threshold {
+            let amount = ((deesser_env - deesser_threshold) / deesser_env.max(1e-6))
+                .clamp(0.0, 1.0)
+                * reduction;
+            for (channel, high_sample) in high_band.iter().enumerate().take(channels) {
+                let index = start + channel;
+                output[index] -= high_sample * amount;
+            }
+        }
+        let level = (0..channels)
+            .map(|channel| output[start + channel].abs())
+            .fold(0.0f32, f32::max);
+        let coeff = if level > reverb_env {
+            attack
+        } else {
+            reverb_release
+        };
+        reverb_env += (level - reverb_env) * coeff;
+        if settings.dereverb_enabled && reverb_env < 0.01 {
+            let attenuation = 1.0 - reverb_amount * (1.0 - (reverb_env / 0.01).clamp(0.0, 1.0));
+            for channel in 0..channels {
+                output[start + channel] *= attenuation;
+            }
+        }
+    }
     Ok(output)
 }
 
@@ -3953,6 +4403,13 @@ fn pre_effect_cache_path(
     settings.hum_frequency_hz.hash(&mut hasher);
     settings.gate_bypass.hash(&mut hasher);
     settings.gate_threshold_db.to_bits().hash(&mut hasher);
+    settings.declick_enabled.hash(&mut hasher);
+    settings.declip_enabled.hash(&mut hasher);
+    settings.deesser_enabled.hash(&mut hasher);
+    settings.deesser_threshold_db.to_bits().hash(&mut hasher);
+    settings.deesser_reduction_db.to_bits().hash(&mut hasher);
+    settings.dereverb_enabled.hash(&mut hasher);
+    settings.dereverb_amount.to_bits().hash(&mut hasher);
     Some(
         std::env::temp_dir()
             .join("izotay-source-cache")
@@ -4020,6 +4477,16 @@ fn cache_pre_effects(
     let release = 1.0 - (-1.0 / (sample_rate as f32 * 0.12)).exp();
     let mut envelope = 0.0f32;
     let mut gate_gain = 1.0f32;
+    let mut highpass_state = vec![0.0f32; channels];
+    let mut deesser_envelope = 0.0f32;
+    let mut dereverb_envelope = 0.0f32;
+    let deesser_alpha = (-std::f32::consts::TAU * 5_500.0 / sample_rate as f32).exp();
+    let deesser_threshold = 10.0f32.powf(settings.deesser_threshold_db.clamp(-60.0, 0.0) / 20.0);
+    let deesser_reduction =
+        1.0 - 10.0f32.powf(-settings.deesser_reduction_db.clamp(0.0, 18.0) / 20.0);
+    let deesser_attack = 1.0 - (-1.0 / (sample_rate as f32 * 0.003)).exp();
+    let deesser_release = 1.0 - (-1.0 / (sample_rate as f32 * 0.045)).exp();
+    let dereverb_release = 1.0 - (-1.0 / (sample_rate as f32 * 0.35)).exp();
 
     for frame_index in 0..frame_count {
         if frame_index % 16_384 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -4027,6 +4494,9 @@ fn cache_pre_effects(
         }
         let start = frame_index * channels;
         frame.copy_from_slice(&source[start..start + channels]);
+        for (channel, sample) in frame.iter_mut().enumerate() {
+            *sample = repair_sample(source, frame_index, channel, channels, settings);
+        }
         if let Some(alpha) = highpass_alpha {
             for channel in 0..channels {
                 let input = frame[channel];
@@ -4062,6 +4532,49 @@ fn cache_pre_effects(
                 *sample *= gate_gain;
             }
         }
+        let mut high_energy = 0.0f32;
+        for channel in 0..channels {
+            let low =
+                deesser_alpha * highpass_state[channel] + (1.0 - deesser_alpha) * frame[channel];
+            let high = frame[channel] - low;
+            highpass_state[channel] = low;
+            high_energy = high_energy.max(high.abs());
+            frame[channel] = high;
+        }
+        let deesser_coeff = if high_energy > deesser_envelope {
+            deesser_attack
+        } else {
+            deesser_release
+        };
+        deesser_envelope += (high_energy - deesser_envelope) * deesser_coeff;
+        if settings.deesser_enabled && deesser_envelope > deesser_threshold {
+            let amount = ((deesser_envelope - deesser_threshold) / deesser_envelope.max(1e-6))
+                .clamp(0.0, 1.0)
+                * deesser_reduction;
+            for sample in &mut frame {
+                *sample *= 1.0 - amount;
+            }
+        }
+        for channel in 0..channels {
+            frame[channel] += highpass_state[channel];
+        }
+        let level = frame
+            .iter()
+            .fold(0.0f32, |peak, value| peak.max(value.abs()));
+        let dereverb_coeff = if level > dereverb_envelope {
+            deesser_attack
+        } else {
+            dereverb_release
+        };
+        dereverb_envelope += (level - dereverb_envelope) * dereverb_coeff;
+        if settings.dereverb_enabled && dereverb_envelope < 0.01 {
+            let attenuation = 1.0
+                - settings.dereverb_amount.clamp(0.0, 1.0)
+                    * (1.0 - (dereverb_envelope / 0.01).clamp(0.0, 1.0));
+            for sample in &mut frame {
+                *sample *= attenuation;
+            }
+        }
         for sample in &frame {
             output.append_sample(*sample)?;
         }
@@ -4079,7 +4592,11 @@ fn cached_pre_effect_samples(
 ) -> Result<Arc<SampleBuffer>, String> {
     let needs_processing = (!settings.rumble_bypass && settings.rumble_cutoff_hz > 0.0)
         || !settings.hum_bypass
-        || !settings.gate_bypass;
+        || !settings.gate_bypass
+        || settings.declick_enabled
+        || settings.declip_enabled
+        || settings.deesser_enabled
+        || settings.dereverb_enabled;
     if !needs_processing {
         return Ok(source.clone());
     }
@@ -4348,6 +4865,7 @@ fn prepare_mix_playback_with_preview(
             sample_rate: track.audio.sample_rate,
             gain_left: track.settings.gain * (1.0 - track.settings.pan.clamp(-1.0, 1.0).max(0.0)),
             gain_right: track.settings.gain * (1.0 + track.settings.pan.clamp(-1.0, 1.0).min(0.0)),
+            automation: track.settings.gain_automation.clone(),
             clips: track.settings.clips.clone(),
         });
     }
@@ -5474,16 +5992,208 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, Audio, AudioControls, ClipSettings, ExportSettings, MixPlayback, MixRequest,
-        MixWorker, PreparedTrack, SampleBuffer, SampleStorage, SessionFile, Track, TrackSettings,
-        WaveformCache, cached_denoise_samples_controlled, cached_pre_effect_samples,
-        denoise_cache_path, expander_samples, highpass_samples, make_render_state,
-        noise_profile_range, peak_data, peak_data_controlled, pre_effect_cache_path,
-        process_effects_in_preview, process_pre_denoise, prune_sample_cache_with_limit,
+        App, Audio, AudioControls, ClipSettings, ExportSettings, GainPoint, MixPlayback,
+        MixRequest, MixWorker, PreparedTrack, SampleBuffer, SampleStorage, SessionFile,
+        SpectrogramCache, Track, TrackSettings, WaveformCache, build_spectrogram,
+        cached_denoise_samples_controlled, cached_pre_effect_samples, default_deesser_reduction,
+        default_deesser_threshold, default_dereverb_amount, denoise_cache_path, expander_samples,
+        gain_at_time, highpass_samples, make_render_state, noise_profile_range, peak_data,
+        peak_data_controlled, pre_effect_cache_path, process_effects_in_preview,
+        process_pre_denoise, process_stage3_effects, prune_sample_cache_with_limit,
         read_media_audio, read_wav, render, render_mix, source_sample_cache_path, write_mix_wav_24,
         write_mix_wav_controlled,
     };
     use std::sync::{Arc, atomic::Ordering};
+
+    fn basic_settings() -> TrackSettings {
+        TrackSettings {
+            name: "test".into(),
+            path: "test.wav".into(),
+            gain: 1.0,
+            pan: 0.0,
+            mute: false,
+            solo: false,
+            rumble_cutoff_hz: 0.0,
+            rumble_bypass: true,
+            hum_frequency_hz: 50,
+            hum_bypass: true,
+            gate_threshold_db: -45.0,
+            gate_bypass: true,
+            denoise_reduction_db: 12.0,
+            denoise_bypass: true,
+            denoise_profile_range: None,
+            declick_enabled: false,
+            declip_enabled: false,
+            deesser_enabled: false,
+            deesser_threshold_db: -24.0,
+            deesser_reduction_db: 6.0,
+            dereverb_enabled: false,
+            dereverb_amount: 0.35,
+            gain_automation: Vec::new(),
+            clips: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn gain_automation_interpolates_and_defaults_to_unity_before_first_point() {
+        let points = vec![
+            GainPoint {
+                time: 2.0,
+                gain: 0.5,
+            },
+            GainPoint {
+                time: 4.0,
+                gain: 1.5,
+            },
+        ];
+        assert_eq!(gain_at_time(&points, 1.0), 1.0);
+        assert_eq!(gain_at_time(&points, 2.0), 0.5);
+        assert_eq!(gain_at_time(&points, 3.0), 1.0);
+        assert_eq!(gain_at_time(&points, 5.0), 1.5);
+    }
+
+    #[test]
+    fn playback_mixer_applies_gain_automation() {
+        let playback = MixPlayback {
+            tracks: vec![PreparedTrack {
+                source_index: 0,
+                samples: Arc::new(SampleBuffer::owned(vec![1.0; 8])),
+                processed_regions: Vec::new(),
+                preview_range: None,
+                channels: 1,
+                sample_rate: 1,
+                gain_left: 1.0,
+                gain_right: 1.0,
+                automation: vec![
+                    GainPoint {
+                        time: 0.0,
+                        gain: 0.0,
+                    },
+                    GainPoint {
+                        time: 2.0,
+                        gain: 2.0,
+                    },
+                ],
+                clips: vec![ClipSettings {
+                    source_start: 0.0,
+                    source_end: 4.0,
+                    position: 0.0,
+                    fade_in_seconds: 0.0,
+                    fade_out_seconds: 0.0,
+                    gain: 1.0,
+                }],
+            }],
+            sample_rate: 4,
+            frames: 8,
+        };
+        assert!((playback.raw_frame_at_time(0.5)[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn older_track_settings_migrate_with_stage3_disabled() {
+        let mut value = serde_json::to_value(basic_settings()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "declick_enabled",
+            "declip_enabled",
+            "deesser_enabled",
+            "deesser_threshold_db",
+            "deesser_reduction_db",
+            "dereverb_enabled",
+            "dereverb_amount",
+            "gain_automation",
+        ] {
+            object.remove(key);
+        }
+        let migrated: TrackSettings = serde_json::from_value(value).unwrap();
+        assert!(
+            !migrated.declick_enabled
+                && !migrated.declip_enabled
+                && !migrated.deesser_enabled
+                && !migrated.dereverb_enabled
+        );
+        assert!(migrated.gain_automation.is_empty());
+        assert_eq!(migrated.deesser_threshold_db, -24.0);
+        assert_eq!(migrated.dereverb_amount, 0.35);
+    }
+
+    #[test]
+    fn de_click_repairs_an_isolated_impulse() {
+        let mut settings = basic_settings();
+        settings.declick_enabled = true;
+        let output =
+            process_stage3_effects(&[0.1, 0.1, 0.95, 0.1, 0.1], 1, 48_000, &settings, None)
+                .unwrap();
+        assert!((output[2] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn de_clip_interpolates_a_contiguous_flat_top() {
+        let mut settings = basic_settings();
+        settings.declip_enabled = true;
+        let output = process_stage3_effects(
+            &[0.0, 0.99, 0.99, 0.99, 0.99, 0.0],
+            1,
+            48_000,
+            &settings,
+            None,
+        )
+        .unwrap();
+        assert!(output[1..5].iter().all(|sample| sample.abs() < 1e-6));
+    }
+
+    #[test]
+    fn de_esser_reduces_sibilant_band_more_than_low_tone() {
+        let mut settings = basic_settings();
+        settings.deesser_enabled = true;
+        settings.deesser_threshold_db = -24.0;
+        settings.deesser_reduction_db = 12.0;
+        let tone = |frequency: f32| {
+            (0..48_000)
+                .map(|frame| {
+                    (std::f32::consts::TAU * frequency * frame as f32 / 48_000.0).sin() * 0.3
+                })
+                .collect::<Vec<_>>()
+        };
+        let rms = |values: &[f32]| {
+            (values.iter().map(|x| x * x).sum::<f32>() / values.len() as f32).sqrt()
+        };
+        let low = tone(1_000.0);
+        let high = tone(8_000.0);
+        let low_out = process_stage3_effects(&low, 1, 48_000, &settings, None).unwrap();
+        let high_out = process_stage3_effects(&high, 1, 48_000, &settings, None).unwrap();
+        assert!(rms(&high_out) < rms(&high) * 0.8);
+        assert!(rms(&low_out) > rms(&low) * 0.9);
+    }
+
+    #[test]
+    fn de_reverb_reduces_a_quiet_sustained_tail() {
+        let mut settings = basic_settings();
+        settings.dereverb_enabled = true;
+        settings.dereverb_amount = 0.6;
+        let output =
+            process_stage3_effects(&vec![0.005; 48_000], 1, 48_000, &settings, None).unwrap();
+        assert!(output[40_000].abs() < 0.005 * 0.8);
+    }
+
+    #[test]
+    fn spectrogram_cache_has_a_detectable_tone_bin() {
+        let samples = (0..16_384)
+            .map(|frame| (std::f32::consts::TAU * 1_000.0 * frame as f32 / 48_000.0).sin() * 0.5)
+            .collect::<Vec<_>>();
+        let cache = build_spectrogram(&samples, 1, 48_000);
+        assert!(!cache.columns.is_empty());
+        let peak = cache.columns[0]
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, value)| *value)
+            .unwrap()
+            .0;
+        assert!(
+            (9..=12).contains(&peak),
+            "expected 1 kHz near FFT bin 11, got {peak}"
+        );
+    }
 
     #[test]
     fn highpass_bypass_preserves_audio() {
@@ -5568,6 +6278,14 @@ mod tests {
             denoise_reduction_db: 12.0,
             denoise_bypass: true,
             denoise_profile_range: None,
+            declick_enabled: false,
+            declip_enabled: false,
+            deesser_enabled: false,
+            deesser_threshold_db: default_deesser_threshold(),
+            deesser_reduction_db: default_deesser_reduction(),
+            dereverb_enabled: false,
+            dereverb_amount: default_dereverb_amount(),
+            gain_automation: Vec::new(),
             clips: vec![ClipSettings {
                 source_start: 0.0,
                 source_end: 1.0,
@@ -5596,6 +6314,7 @@ mod tests {
             sample_rate: 1000,
             gain_left: 1.0,
             gain_right: 1.0,
+            automation: Vec::new(),
             clips: settings.clips,
         };
         assert_eq!(track.sample(100, 0, 0.1), 0.25);
@@ -5622,7 +6341,11 @@ mod tests {
             .map(|index| {
                 let frame = index / channels;
                 let tone = (frame as f32 * 0.037).sin() * 0.35;
-                if frame % 997 < 120 {
+                if frame == 400 {
+                    0.95
+                } else if (1200..=1203).contains(&frame) {
+                    0.99
+                } else if frame % 997 < 120 {
                     tone * 0.025
                 } else {
                     tone
@@ -5645,6 +6368,14 @@ mod tests {
             denoise_reduction_db: 12.0,
             denoise_bypass: true,
             denoise_profile_range: None,
+            declick_enabled: true,
+            declip_enabled: true,
+            deesser_enabled: true,
+            deesser_threshold_db: default_deesser_threshold(),
+            deesser_reduction_db: default_deesser_reduction(),
+            dereverb_enabled: true,
+            dereverb_amount: default_dereverb_amount(),
+            gain_automation: Vec::new(),
             clips: Vec::new(),
         };
         let expected =
@@ -5826,6 +6557,14 @@ mod tests {
             denoise_reduction_db: 12.0,
             denoise_bypass: true,
             denoise_profile_range: None,
+            declick_enabled: false,
+            declip_enabled: false,
+            deesser_enabled: false,
+            deesser_threshold_db: default_deesser_threshold(),
+            deesser_reduction_db: default_deesser_reduction(),
+            dereverb_enabled: false,
+            dereverb_amount: default_dereverb_amount(),
+            gain_automation: Vec::new(),
             clips: vec![ClipSettings {
                 source_start: 0.0,
                 source_end: audio.samples.len() as f64
@@ -5843,6 +6582,7 @@ mod tests {
             settings,
             audio,
             waveform: Arc::new(WaveformCache::default()),
+            spectrogram: Arc::new(SpectrogramCache::default()),
             offline: false,
         };
         let mix = render_mix(std::slice::from_ref(&track)).unwrap();
@@ -5999,6 +6739,23 @@ mod tests {
                 denoise_reduction_db: 15.0,
                 denoise_bypass: false,
                 denoise_profile_range: Some((1.25, 2.75)),
+                declick_enabled: true,
+                declip_enabled: false,
+                deesser_enabled: true,
+                deesser_threshold_db: default_deesser_threshold(),
+                deesser_reduction_db: default_deesser_reduction(),
+                dereverb_enabled: true,
+                dereverb_amount: default_dereverb_amount(),
+                gain_automation: vec![
+                    GainPoint {
+                        time: 1.0,
+                        gain: 0.75,
+                    },
+                    GainPoint {
+                        time: 3.0,
+                        gain: 1.25,
+                    },
+                ],
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 4.0,
@@ -6014,13 +6771,18 @@ mod tests {
                 channels: 2,
             },
             waveform: Arc::new(WaveformCache::default()),
+            spectrogram: Arc::new(SpectrogramCache::default()),
             offline: false,
         });
         app.write_session_to(&path).unwrap();
         let session: SessionFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(session.format_version, 14);
+        assert_eq!(session.format_version, 15);
         assert_eq!(session.tracks.len(), 1);
         assert_eq!(session.tracks[0].denoise_profile_range, Some((1.25, 2.75)));
+        assert!(session.tracks[0].declick_enabled);
+        assert!(session.tracks[0].deesser_enabled);
+        assert!(session.tracks[0].dereverb_enabled);
+        assert_eq!(session.tracks[0].gain_automation.len(), 2);
         drop(app);
         std::fs::remove_file(path).unwrap();
     }
@@ -6039,6 +6801,7 @@ mod tests {
                 sample_rate: 2,
                 gain_left: 1.0,
                 gain_right: 1.0,
+                automation: Vec::new(),
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,
@@ -6076,6 +6839,7 @@ mod tests {
                 sample_rate: 2,
                 gain_left: 1.0,
                 gain_right: 1.0,
+                automation: Vec::new(),
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,
@@ -6134,6 +6898,7 @@ mod tests {
                 sample_rate: 2,
                 gain_left: 1.0,
                 gain_right: 1.0,
+                automation: Vec::new(),
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,
@@ -6173,6 +6938,14 @@ mod tests {
                 denoise_reduction_db: 12.0,
                 denoise_bypass: true,
                 denoise_profile_range: None,
+                declick_enabled: false,
+                declip_enabled: false,
+                deesser_enabled: false,
+                deesser_threshold_db: default_deesser_threshold(),
+                deesser_reduction_db: default_deesser_reduction(),
+                dereverb_enabled: false,
+                dereverb_amount: default_dereverb_amount(),
+                gain_automation: Vec::new(),
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,
@@ -6188,6 +6961,7 @@ mod tests {
                 channels: 1,
             },
             waveform: Arc::new(WaveformCache::default()),
+            spectrogram: Arc::new(SpectrogramCache::default()),
             offline: false,
         };
         let mix = render_mix(&[track]).unwrap();
