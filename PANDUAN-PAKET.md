@@ -1,6 +1,6 @@
 # Mencoba paket build iZotay
 
-Paket dari GitHub Actions ditujukan untuk uji internal prototipe, bukan installer final. Isinya executable iZotay dan panduan ini. FFmpeg tidak disertakan.
+Paket GitHub Release adalah build preview publik untuk mencoba prototipe, bukan installer final. Isinya executable iZotay, panduan paket ini, dan [Panduan Pengguna](PANDUAN-PENGGUNA.md). FFmpeg tidak disertakan.
 
 ## Persyaratan
 

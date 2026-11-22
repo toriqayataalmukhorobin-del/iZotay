@@ -2,6 +2,9 @@
 
 iZotay adalah prototipe editor desktop lokal untuk dialog, podcast, wawancara, dan voice-over. Sumber media tidak ditimpa; edit klip dan parameter restorasi disimpan sebagai instruksi di sesi `.izotay`.
 
+- **Panduan penggunaan:** [PANDUAN-PENGGUNA.md](PANDUAN-PENGGUNA.md)
+- **Menjalankan paket preview:** [PANDUAN-PAKET.md](PANDUAN-PAKET.md)
+
 ## Fitur yang tersedia
 
 - Impor beberapa WAV, format audio lain, atau video dengan audio sebagai track. Audio video dapat diedit dan diekspor ke MP4 baru; video sumber tidak diubah.
@@ -27,7 +30,7 @@ iZotay adalah prototipe editor desktop lokal untuk dialog, podcast, wawancara, d
 - Preview efek untuk seleksi yang sangat panjang masih menyimpan hasil seleksi di memori.
 - Cache berada di direktori sementara dan dapat dibangun ulang; gunakan file sesi dan media sumber sebagai data proyek utama.
 - FFmpeg harus tersedia di `PATH` untuk format non-WAV, audio video, denoise, dan ekspor MP4.
-- Aplikasi masih prototipe. CI sudah menjalankan tes, Clippy, dan build release di Linux, Windows, dan macOS. Uji perangkat audio/latensi, rekaman dialog nyata, pembaca layar, lisensi dependency, serta packaging installer tetap perlu dilakukan sebelum rilis.
+- Aplikasi masih prototipe/preview. CI menjalankan tes, Clippy, dan build release di Linux, Windows, dan macOS. Uji perangkat audio/latensi, rekaman dialog nyata, pembaca layar, lisensi dependency, serta packaging installer tetap perlu dilakukan sebelum rilis produksi.
 
 ## Persiapan dan menjalankan
 
@@ -54,7 +57,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-Workflow GitHub Actions menjalankan tes, Clippy, dan build release pada Linux, Windows, dan macOS. Workflow mengunggah bundle preview per sistem operasi (`.zip` untuk Windows, `.tar.gz` untuk Linux/macOS) beserta [panduan paket](PANDUAN-PAKET.md). Bundle belum berupa installer dan FFmpeg tetap menjadi dependensi terpisah. CI tidak menguji perangkat audio fisik, latensi playback, screen reader, ataupun kualitas restorasi pada rekaman produksi.
+Workflow GitHub Actions menjalankan tes, Clippy, dan build release pada Linux, Windows, dan macOS. Workflow mengunggah bundle preview per sistem operasi (`.zip` untuk Windows, `.tar.gz` untuk Linux/macOS) beserta [panduan paket](PANDUAN-PAKET.md). Tag `v*` membuat GitHub Release preview dengan ketiga bundle. Paket belum berupa installer dan FFmpeg tetap menjadi dependensi terpisah. CI tidak menguji perangkat audio fisik, latensi playback, screen reader, ataupun kualitas restorasi pada rekaman produksi.
 
 ## Arsitektur
 
@@ -73,4 +76,4 @@ Keputusan teknis dan batas yang diketahui ada di [KEPUTUSAN-TEKNIS.md](KEPUTUSAN
 
 ## Lisensi
 
-Metadata paket saat ini menyatakan lisensi MIT (`Cargo.toml`). Lisensi dependency pihak ketiga tetap mengikuti lisensi masing-masing.
+Kode proyek menggunakan lisensi [MIT](LICENSE). Lisensi dependency pihak ketiga tetap mengikuti lisensi masing-masing.

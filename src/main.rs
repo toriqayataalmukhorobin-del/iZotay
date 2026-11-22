@@ -3243,19 +3243,27 @@ impl eframe::App for App {
         }
         let mut style = (*ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(14.0, 9.0);
-        style.spacing.interact_size.y = 32.0;
+        style.spacing.button_padding = egui::vec2(11.0, 7.0);
+        style.spacing.interact_size.y = 30.0;
         style.spacing.slider_width = 150.0;
         style.visuals.panel_fill = egui::Color32::from_rgb(18, 23, 25);
         style.visuals.window_fill = egui::Color32::from_rgb(27, 34, 36);
         style.visuals.extreme_bg_color = egui::Color32::from_rgb(10, 13, 14);
         style.visuals.faint_bg_color = egui::Color32::from_rgb(31, 40, 42);
         style.visuals.override_text_color = Some(egui::Color32::from_rgb(226, 234, 232));
-        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(37, 47, 49);
+        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(27, 35, 37);
+        style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(27, 35, 37);
+        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.inactive.bg_stroke =
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(43, 54, 56));
         style.visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(226, 234, 232);
-        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(43, 70, 65);
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(38, 58, 56);
+        style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(38, 58, 56);
+        style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
         style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
         style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(24, 112, 94);
+        style.visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(24, 112, 94);
+        style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
         style.visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
         style.visuals.hyperlink_color = egui::Color32::from_rgb(91, 207, 181);
         style.visuals.selection.bg_fill = egui::Color32::from_rgb(24, 103, 87);
@@ -3263,6 +3271,9 @@ impl eframe::App for App {
             egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(103, 222, 192));
         style.visuals.widgets.hovered.bg_stroke =
             egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(103, 222, 192));
+        style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.noninteractive.bg_stroke =
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 48, 50));
         if self.high_contrast {
             style.visuals.panel_fill = egui::Color32::BLACK;
             style.visuals.window_fill = egui::Color32::from_rgb(8, 8, 8);
@@ -3292,7 +3303,12 @@ impl eframe::App for App {
                             !self.import_in_progress
                                 && !self.relink_in_progress
                                 && !self.session_opening,
-                            egui::Button::new("＋ Impor media"),
+                            egui::Button::new("＋  Impor media")
+                                .fill(egui::Color32::from_rgb(18, 91, 77))
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    egui::Color32::from_rgb(45, 154, 130),
+                                )),
                         )
                         .clicked()
                     {
@@ -3313,38 +3329,15 @@ impl eframe::App for App {
                         self.save_session();
                     }
                     ui.separator();
-                    if let Some(player) = &self.player {
-                        let is_playing = player.playing.load(Ordering::Relaxed);
-                        if ui
-                            .add_enabled(
-                                self.mix.is_some(),
-                                egui::Button::new(if is_playing {
-                                    "Ⅱ Jeda"
-                                } else {
-                                    "▶ Putar"
-                                }),
-                            )
-                            .clicked()
-                        {
-                            let frame_count = self.mix.as_ref().map_or(0, |mix| mix.frames);
-                            if !is_playing && player.cursor.load(Ordering::Relaxed) >= frame_count {
-                                player.seek(0);
-                            }
-                            player.playing.store(!is_playing, Ordering::Relaxed);
-                        }
-                        if ui.button("■ Stop").clicked() {
-                            player.playing.store(false, Ordering::Relaxed);
-                            player.seek(0);
-                        }
-                    } else {
-                        ui.add_enabled(false, egui::Button::new("▶ Putar"));
-                        ui.add_enabled(false, egui::Button::new("■ Stop"));
-                    }
-                    ui.separator();
                     if ui
                         .add_enabled(
                             !self.export_in_progress && !self.mix_pending && self.mix.is_some(),
-                            egui::Button::new("Ekspor mix…"),
+                            egui::Button::new("Ekspor mix…")
+                                .fill(egui::Color32::from_rgb(18, 91, 77))
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    egui::Color32::from_rgb(45, 154, 130),
+                                )),
                         )
                         .clicked()
                     {
@@ -3613,15 +3606,245 @@ impl eframe::App for App {
         }
         let mut denoise_profile_request = None;
         let mut alignment_request = None;
+        let inspector_before = self.snapshot();
+        let mut inspector_changed = false;
+        let mut transport_play_clicked = false;
+        let mut transport_stop_clicked = false;
+        egui::TopBottomPanel::bottom("transport")
+            .exact_height(76.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let current = self.playhead_seconds.max(0.0);
+                    ui.monospace(format!("{current:06.2}"));
+                    let mut seek_seconds = current as f32;
+                    let duration = self
+                        .mix
+                        .as_ref()
+                        .map(|mix| mix.frames as f64 / mix.sample_rate.max(1) as f64)
+                        .unwrap_or(0.0);
+                    let seek = ui.add_sized(
+                        [(ui.available_width() - 270.0).max(120.0), 22.0],
+                        egui::Slider::new(&mut seek_seconds, 0.0..=duration.max(0.01) as f32)
+                            .show_value(false),
+                    );
+                    if seek.changed() {
+                        self.playhead_seconds = seek_seconds as f64;
+                        if let (Some(player), Some(mix)) = (&self.player, &self.mix) {
+                            player.seek((self.playhead_seconds * mix.sample_rate as f64) as usize);
+                        }
+                    }
+                    ui.label(format!("{:05.2}", duration));
+                    let is_playing = self
+                        .player
+                        .as_ref()
+                        .is_some_and(|player| player.playing.load(Ordering::Relaxed));
+                    transport_play_clicked = ui
+                        .add_enabled(
+                            self.mix.is_some(),
+                            egui::Button::new(
+                                egui::RichText::new(if is_playing {
+                                    "Ⅱ  Jeda"
+                                } else {
+                                    "▶  Putar"
+                                })
+                                .color(egui::Color32::from_rgb(5, 28, 24))
+                                .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(65, 205, 174))
+                            .stroke(egui::Stroke::NONE),
+                        )
+                        .clicked();
+                    transport_stop_clicked = ui
+                        .add_enabled(self.player.is_some(), egui::Button::new("■  Stop"))
+                        .clicked();
+                    if let Some(player) = &self.player {
+                        let peak = player.master_peak().clamp(0.0, 1.0);
+                        ui.label("MASTER");
+                        ui.add(egui::ProgressBar::new(peak).desired_width(108.0));
+                        ui.weak(if peak > 0.0 {
+                            format!("{:.1} dBFS", 20.0 * peak.log10())
+                        } else {
+                            "−∞ dBFS".to_owned()
+                        });
+                    }
+                });
+                ui.add_space(2.0);
+                ui.weak("Space putar/jeda    S split    Ctrl/Cmd+Z undo    Ctrl/Cmd+D duplikasi");
+            });
+        if transport_play_clicked {
+            if let (Some(player), Some(mix)) = (&self.player, &self.mix) {
+                let is_playing = player.playing.load(Ordering::Relaxed);
+                if !is_playing && player.cursor.load(Ordering::Relaxed) >= mix.frames {
+                    player.seek(0);
+                }
+                player.playing.store(!is_playing, Ordering::Relaxed);
+            }
+        }
+        if transport_stop_clicked {
+            if let Some(player) = &self.player {
+                player.playing.store(false, Ordering::Relaxed);
+                player.seek(0);
+            }
+            self.playhead_seconds = 0.0;
+        }
+        egui::SidePanel::right("inspector")
+            .resizable(true)
+            .default_width(316.0)
+            .width_range(270.0..=430.0)
+            .show(ctx, |ui| {
+                ui.heading("Inspector");
+                ui.label("Pengaturan klip dan track terpilih");
+                ui.separator();
+                if let Some((track_index, clip_index)) = self.selected_clip {
+                    if let Some(track) = self.tracks.get_mut(track_index) {
+                        if let Some(clip) = track.settings.clips.get_mut(clip_index) {
+                            let track_name = track.settings.name.clone();
+                            ui.strong("Klip terpilih");
+                            ui.weak(format!(
+                                "{} · {:.2} s",
+                                track_name,
+                                clip.source_end - clip.source_start
+                            ));
+                            inspector_changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut clip.gain, 0.0..=4.0)
+                                        .text("Gain klip ×"),
+                                )
+                                .changed();
+                            let max_fade = (clip.source_end - clip.source_start).min(2.0);
+                            inspector_changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut clip.fade_in_seconds, 0.0..=max_fade)
+                                        .text("Fade in"),
+                                )
+                                .changed();
+                            inspector_changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut clip.fade_out_seconds, 0.0..=max_fade)
+                                        .text("Fade out"),
+                                )
+                                .changed();
+                        }
+                    }
+                    let overlap = crossfade_overlap(&self.tracks, (track_index, clip_index));
+                    let crossfade_label = overlap.map_or_else(
+                        || "Crossfade · perlu klip overlap".to_owned(),
+                        |(_, _, _, seconds)| format!("Buat crossfade · {seconds:.2} s"),
+                    );
+                    if ui
+                        .add_enabled(overlap.is_some(), egui::Button::new(crossfade_label))
+                        .clicked()
+                    {
+                        self.make_crossfade_for_selected();
+                    }
+                } else {
+                    ui.weak("Pilih klip di timeline untuk mengatur gain dan fade.");
+                }
+                ui.separator();
+                if let Some(index) = self.selected_track {
+                    if let Some(track) = self.tracks.get_mut(index) {
+                        ui.strong("Track");
+                        inspector_changed |=
+                            ui.text_edit_singleline(&mut track.settings.name).changed();
+                        inspector_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut track.settings.gain, 0.0..=2.0)
+                                    .text("Gain track"),
+                            )
+                            .changed();
+                        inspector_changed |= ui
+                            .add(egui::Slider::new(&mut track.settings.pan, -1.0..=1.0).text("Pan"))
+                            .changed();
+                        ui.horizontal(|ui| {
+                            inspector_changed |=
+                                ui.checkbox(&mut track.settings.mute, "Mute").changed();
+                            inspector_changed |=
+                                ui.checkbox(&mut track.settings.solo, "Solo").changed();
+                        });
+                        ui.collapsing("Otomasi gain", |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut self.automation_gain_value, 0.0..=4.0)
+                                    .text("Gain titik ×"),
+                            );
+                            if ui.button("Tambah titik di playhead").clicked() {
+                                track.settings.gain_automation.push(GainPoint {
+                                    time: self.playhead_seconds.max(0.0),
+                                    gain: self.automation_gain_value,
+                                });
+                                track
+                                    .settings
+                                    .gain_automation
+                                    .sort_by(|a, b| a.time.total_cmp(&b.time));
+                                track
+                                    .settings
+                                    .gain_automation
+                                    .dedup_by(|a, b| a.time == b.time);
+                                inspector_changed = true;
+                            }
+                            if ui.button("Hapus titik terdekat").clicked()
+                                && let Some((point_index, _)) =
+                                    track.settings.gain_automation.iter().enumerate().min_by(
+                                        |(_, a), (_, b)| {
+                                            (a.time - self.playhead_seconds)
+                                                .abs()
+                                                .total_cmp(&(b.time - self.playhead_seconds).abs())
+                                        },
+                                    )
+                            {
+                                track.settings.gain_automation.remove(point_index);
+                                inspector_changed = true;
+                            }
+                        });
+                        ui.collapsing("Restorasi track", |ui| {
+                            let active = usize::from(
+                                !track.settings.rumble_bypass
+                                    && track.settings.rumble_cutoff_hz > 0.0,
+                            ) + usize::from(!track.settings.hum_bypass)
+                                + usize::from(!track.settings.gate_bypass)
+                                + usize::from(
+                                    !track.settings.denoise_bypass
+                                        && track.settings.denoise_reduction_db > 0.0,
+                                )
+                                + usize::from(track.settings.declick_enabled)
+                                + usize::from(track.settings.declip_enabled)
+                                + usize::from(track.settings.deesser_enabled)
+                                + usize::from(track.settings.dereverb_enabled)
+                                + usize::from(track.settings.bleed_enabled);
+                            ui.label(format!(
+                                "{active} efek restorasi aktif"
+                            ));
+                            ui.weak("Buka bagian Restorasi pada track di timeline untuk mengubah detailnya.");
+                        });
+                    }
+                } else {
+                    ui.weak("Pilih track untuk mengatur level, pan, restorasi, dan otomasi.");
+                }
+            });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.heading("Studio audio & dialog");
-                    ui.weak("Edit rekaman audio dan audio dari video. Sumber asli tetap aman.");
+                ui.label(egui::RichText::new("Dialog edit").size(21.0).strong());
+                ui.label("·");
+                ui.weak(if self.tracks.is_empty() {
+                    "Studio restorasi audio & video"
+                } else {
+                    "Perubahan tersimpan otomatis"
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("Space putar/jeda · S split · Ctrl/Cmd+I impor · Ctrl/Cmd+O buka · Ctrl/Cmd+S simpan");
-                    ui.weak("Ctrl/Cmd+Z/Y undo/redo · Ctrl/Cmd+D duplikasi");
+                    if !self.tracks.is_empty() {
+                        let seconds = self
+                            .mix
+                            .as_ref()
+                            .map(|mix| mix.frames as f64 / mix.sample_rate.max(1) as f64)
+                            .unwrap_or(0.0);
+                        ui.weak(format!(
+                            "{} track  ·  {:.1} s  ·  {} Hz",
+                            self.tracks.len(),
+                            seconds,
+                            self.mix.as_ref().map_or(0, |mix| mix.sample_rate)
+                        ));
+                    } else {
+                        ui.weak("Sumber asli tetap aman");
+                    }
                 });
             });
             ui.separator();
@@ -3677,24 +3900,88 @@ impl eframe::App for App {
                 );
             }
             if self.tracks.is_empty() {
-                ui.add_space(24.0);
-                egui::Frame::group(ui.style())
-                    .inner_margin(egui::Margin::same(22))
-                    .show(ui, |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.heading("Mulai dari audio atau video");
-                            ui.label("WAV, MP3, M4A, MP4, MOV, MKV, WebM, dan format lain yang didukung FFmpeg.");
-                            ui.add_space(8.0);
-                            if ui
-                                .add_sized([230.0, 42.0], egui::Button::new("＋ Pilih media untuk diedit"))
-                                .clicked()
-                            {
-                                self.import_files();
-                            }
-                            ui.add_space(4.0);
-                            ui.weak("Audio video akan tampil sebagai waveform; video asli tidak diubah.");
-                        });
-                    });
+                let available = ui.available_size();
+                ui.allocate_ui_with_layout(
+                    available,
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(16, 22, 23))
+                            .stroke(egui::Stroke::new(
+                                1.0_f32,
+                                egui::Color32::from_rgb(43, 58, 58),
+                            ))
+                            .corner_radius(12)
+                            .inner_margin(egui::Margin::same(28))
+                            .show(ui, |ui| {
+                                ui.set_min_width((available.x - 48.0).clamp(320.0, 720.0));
+                                ui.set_min_height((available.y - 32.0).clamp(240.0, 390.0));
+                                ui.vertical_centered(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("IZ")
+                                            .size(11.0)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(113, 232, 202)),
+                                    );
+                                    let (wave_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(280.0, 50.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let painter = ui.painter_at(wave_rect);
+                                    for index in 0..39 {
+                                        let envelope =
+                                            0.22 + 0.78 * (index as f32 * 0.37).sin().abs();
+                                        let height = 8.0 + envelope * (13.0 + (index % 5) as f32 * 3.0);
+                                        let x = wave_rect.left() + 4.0 + index as f32 * 7.0;
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(x, wave_rect.center().y - height),
+                                                egui::pos2(x, wave_rect.center().y + height),
+                                            ],
+                                            (
+                                                2.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    91,
+                                                    207,
+                                                    181,
+                                                    150,
+                                                ),
+                                            ),
+                                        );
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new("Mulai edit audio dan video")
+                                            .size(24.0)
+                                            .strong(),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        "Potong, bersihkan, dan seimbangkan dialog dalam satu timeline.",
+                                    );
+                                    ui.add_space(18.0);
+                                    if ui
+                                        .add_sized(
+                                            [232.0, 42.0],
+                                            egui::Button::new("＋  Pilih media")
+                                                .fill(egui::Color32::from_rgb(20, 111, 92))
+                                                .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                    egui::Color32::from_rgb(70, 202, 170),
+                                                )),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.import_files();
+                                    }
+                                    ui.add_space(16.0);
+                                    ui.weak(
+                                        "WAV · MP3 · M4A · MP4 · MOV · MKV · WebM  /  Sumber asli tidak diubah",
+                                    );
+                                });
+                            });
+                    },
+                );
             }
             let duration = self
                 .tracks
@@ -3709,28 +3996,13 @@ impl eframe::App for App {
                 .max(self.markers.iter().map(|m| m.position).fold(0.0, f64::max))
                 .max(1.0);
             if let Some(player) = &self.player {
-                let total_frames = self
-                    .mix
-                    .as_ref()
-                    .map_or(0, |mix| mix.frames);
-                if total_frames > 0 {
+                let total_frames = self.mix.as_ref().map_or(0, |mix| mix.frames);
+                if player.playing.load(Ordering::Relaxed) && total_frames > 0 {
                     let cursor = player.cursor.load(Ordering::Relaxed).min(total_frames);
-                    if player.playing.load(Ordering::Relaxed) {
-                        self.playhead_seconds =
-                            cursor as f64 / self.mix.as_ref().unwrap().sample_rate as f64;
-                        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                    if let Some(mix) = &self.mix {
+                        self.playhead_seconds = cursor as f64 / mix.sample_rate as f64;
                     }
-                    let mut seconds = self.playhead_seconds as f32;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut seconds, 0.0..=duration as f32)
-                                .text("Playhead / detik"),
-                        )
-                        .changed()
-                    {
-                        self.playhead_seconds = seconds as f64;
-                        player.seek((seconds as f64 * self.mix.as_ref().unwrap().sample_rate as f64) as usize);
-                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
                 }
             }
             let mut changed = false;
@@ -3738,128 +4010,60 @@ impl eframe::App for App {
             let mut checkpoint_drag = false;
             let mut relink_request = None;
             let settings_before = self.snapshot();
-            if let Some((track_index, clip_index)) = self.selected_clip
-                && let Some(clip) = self
-                    .tracks
-                    .get_mut(track_index)
-                    .and_then(|track| track.settings.clips.get_mut(clip_index))
-            {
-                let clip_duration = (clip.source_end - clip.source_start).max(0.0);
-                let max_fade = clip_duration.min(2.0);
+            if !self.tracks.is_empty() {
+                let mut view_settings_changed = false;
                 ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(egui::Slider::new(&mut clip.gain, 0.0..=4.0).text("Gain klip ×"))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    changed |= ui
+                    view_settings_changed |=
+                        ui.checkbox(&mut self.spectrogram_view, "Spectrogram").changed();
+                    ui.label("Zoom");
+                    view_settings_changed |= ui
                         .add(
-                            egui::Slider::new(&mut clip.fade_in_seconds, 0.0..=max_fade)
-                                .text("Fade in s"),
+                            egui::Slider::new(&mut self.timeline_zoom, 0.25..=4.0)
+                                .logarithmic(true)
+                                .custom_formatter(|value, _| {
+                                    format!("{:.0} px/s", value * 100.0)
+                                }),
                         )
                         .changed();
-                    changed |= ui
+                    view_settings_changed |= ui
                         .add(
-                            egui::Slider::new(&mut clip.fade_out_seconds, 0.0..=max_fade)
-                                .text("Fade out s"),
+                            egui::Slider::new(&mut self.timeline_track_height, 52.0..=220.0)
+                                .text("Track height"),
                         )
                         .changed();
-                });
-            }
-            let crossfade_duration = self
-                .selected_clip
-                .and_then(|selected| crossfade_overlap(&self.tracks, selected))
-                .map(|(_, _, _, overlap)| overlap);
-            if self.selected_clip.is_some() {
-                ui.horizontal(|ui| {
-                    let label = crossfade_duration.map_or_else(
-                        || "Crossfade · perlu klip overlap".to_owned(),
-                        |duration| format!("Buat crossfade · {duration:.2}s"),
-                    );
-                    if ui
-                        .add_enabled(crossfade_duration.is_some(), egui::Button::new(label))
+                    view_settings_changed |= ui.checkbox(&mut self.snap_enabled, "Snap").changed();
+                    view_settings_changed |= ui
+                        .add_enabled(
+                            self.snap_enabled,
+                            egui::Checkbox::new(&mut self.snap_grid_enabled, "Grid"),
+                        )
                         .on_hover_text(
-                            "Mengatur fade out pada klip lebih awal dan fade in pada klip yang overlap.",
+                            "Snap ke garis grid waktu selain playhead, marker, dan klip.",
                         )
-                        .clicked()
-                    {
-                        self.make_crossfade_for_selected();
-                    }
+                        .changed();
+                    let grid_interval_label = format!("{:.2} s", self.snap_grid_interval);
+                    view_settings_changed |= egui::ComboBox::from_id_salt("snap-grid-interval")
+                        .selected_text(grid_interval_label)
+                        .show_ui(ui, |ui| {
+                            let mut changed = false;
+                            for interval in [0.1, 0.25, 0.5, 1.0, 2.0] {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.snap_grid_interval,
+                                        interval,
+                                        format!("{interval:.2} s"),
+                                    )
+                                    .changed();
+                            }
+                            changed
+                        })
+                        .inner
+                        .unwrap_or(false);
                 });
-            }
-            let mut view_settings_changed = false;
-            ui.horizontal(|ui| {
-                view_settings_changed |= ui.checkbox(&mut self.spectrogram_view, "Spectrogram").changed();
-                ui.label("Zoom timeline");
-                view_settings_changed |= ui
-                    .add(
-                    egui::Slider::new(&mut self.timeline_zoom, 0.25..=4.0)
-                        .logarithmic(true)
-                        .custom_formatter(|value, _| format!("{:.0} px/s", value * 100.0)),
-                    )
-                    .changed();
-                view_settings_changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.timeline_track_height, 52.0..=220.0)
-                            .text("Tinggi track"),
-                    )
-                    .changed();
-                view_settings_changed |= ui
-                    .checkbox(&mut self.snap_enabled, "Snap")
-                    .changed();
-                view_settings_changed |= ui
-                    .add_enabled(
-                        self.snap_enabled,
-                        egui::Checkbox::new(&mut self.snap_grid_enabled, "Grid"),
-                    )
-                    .on_hover_text("Snap ke garis grid waktu selain playhead, marker, dan klip.")
-                    .changed();
-                let grid_interval_label = format!("{:.2} s", self.snap_grid_interval);
-                view_settings_changed |= egui::ComboBox::from_id_salt("snap-grid-interval")
-                    .selected_text(grid_interval_label)
-                    .show_ui(ui, |ui| {
-                        let mut changed = false;
-                        for interval in [0.1, 0.25, 0.5, 1.0, 2.0] {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.snap_grid_interval,
-                                    interval,
-                                    format!("{interval:.2} s"),
-                                )
-                                .changed();
-                        }
-                        changed
-                    })
-                    .inner
-                    .unwrap_or(false);
-            });
-            if view_settings_changed {
-                self.last_edit = Some(std::time::Instant::now());
-            }
-            ui.horizontal(|ui| {
-                ui.label("Otomasi gain");
-                ui.add(egui::Slider::new(&mut self.automation_gain_value, 0.0..=4.0).text("Gain titik ×"));
-                let add_point = ui.button("Tambah titik di playhead").clicked();
-                let remove_point = ui.button("Hapus titik terdekat").clicked();
-                ui.weak("Interpolasi linear; titik mengikuti waktu timeline.");
-                if add_point && self.selected_track.is_some()
-                    && let Some(track) = self.selected_track.and_then(|index| self.tracks.get_mut(index)) {
-                    track.settings.gain_automation.push(GainPoint { time: self.playhead_seconds.max(0.0), gain: self.automation_gain_value });
-                    track.settings.gain_automation.sort_by(|a, b| a.time.total_cmp(&b.time));
-                    track.settings.gain_automation.dedup_by(|a, b| a.time == b.time);
-                    changed = true;
+                if view_settings_changed {
                     self.last_edit = Some(std::time::Instant::now());
                 }
-                if remove_point && self.selected_track.is_some()
-                    && let Some(track) = self.selected_track.and_then(|index| self.tracks.get_mut(index))
-                    && let Some((point_index, _)) = track.settings.gain_automation.iter().enumerate().min_by(|(_, a), (_, b)| {
-                        (a.time - self.playhead_seconds).abs().total_cmp(&(b.time - self.playhead_seconds).abs())
-                    }) {
-                    track.settings.gain_automation.remove(point_index);
-                    changed = true;
-                    self.last_edit = Some(std::time::Instant::now());
-                }
-            });
+            }
             let pixels_per_second = 100.0 * self.timeline_zoom;
             let snap_enabled = self.snap_enabled;
             let snap_grid_interval = self
@@ -3917,23 +4121,6 @@ impl eframe::App for App {
                             }
                             changed |= ui.checkbox(&mut track.settings.mute, "Mute").changed();
                             changed |= ui.checkbox(&mut track.settings.solo, "Solo").changed();
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.button("−").clicked() {
-                                track.settings.gain = (track.settings.gain - 0.1).max(0.0);
-                                changed = true;
-                            }
-                            ui.label(format!("Gain {:.1}", track.settings.gain));
-                            if ui.button("+").clicked() {
-                                track.settings.gain = (track.settings.gain + 0.1).min(2.0);
-                                changed = true;
-                            }
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut track.settings.pan, -1.0..=1.0)
-                                        .text("Pan"),
-                                )
-                                .changed();
                         });
                         let active_restoration_count = usize::from(
                             !track.settings.rumble_bypass && track.settings.rumble_cutoff_hz > 0.0,
@@ -4168,13 +4355,30 @@ impl eframe::App for App {
                                     );
                                 }
                                 let xhead = rect.left() + self.playhead_seconds as f32 * pixels_per_second;
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(xhead, rect.top()),
-                                        egui::pos2(xhead, rect.bottom()),
-                                    ],
-                                    (1.0, egui::Color32::YELLOW),
+                                let playhead_grip = egui::Rect::from_center_size(
+                                    egui::pos2(xhead, rect.top() + ruler_height * 0.5),
+                                    egui::vec2(16.0, ruler_height),
                                 );
+                                let playhead_response = ui.interact(
+                                    playhead_grip,
+                                    ui.id().with(("playhead", index)),
+                                    egui::Sense::click_and_drag(),
+                                ).on_hover_text("Tarik pegangan ini untuk memindahkan playhead");
+                                if playhead_response.hovered() {
+                                    ui.output_mut(|output| {
+                                        output.cursor_icon = egui::CursorIcon::ResizeHorizontal;
+                                    });
+                                }
+                                if (playhead_response.clicked() || playhead_response.dragged())
+                                    && let Some(pointer) =
+                                        playhead_response.interact_pointer_pos()
+                                {
+                                    self.playhead_seconds = ((pointer.x - rect.left())
+                                        / pixels_per_second)
+                                        .clamp(0.0, duration as f32)
+                                        as f64;
+                                    seek_from_timeline = true;
+                                }
                                 for (marker_index, marker) in self.markers.iter().enumerate() {
                                     let x = rect.left() + marker.position as f32 * pixels_per_second;
                                     let marker_rect = egui::Rect::from_min_max(
@@ -4435,6 +4639,24 @@ impl eframe::App for App {
                                     }
                                     let _ = clip_index;
                                 }
+                                // Draw after clips and their waveforms so the playhead remains visible.
+                                let xhead =
+                                    rect.left() + self.playhead_seconds as f32 * pixels_per_second;
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(xhead, rect.top()),
+                                        egui::pos2(xhead, rect.bottom()),
+                                    ],
+                                    (
+                                        2.0,
+                                        egui::Color32::from_rgb(255, 198, 78),
+                                    ),
+                                );
+                                painter.circle_filled(
+                                    egui::pos2(xhead, rect.top() + ruler_height * 0.5),
+                                    4.5,
+                                    egui::Color32::from_rgb(255, 198, 78),
+                                );
                             });
                     });
                 }
@@ -4457,6 +4679,11 @@ impl eframe::App for App {
             }
             if let Some(index) = relink_request {
                 self.relink_track(index);
+            }
+            if inspector_changed {
+                self.push_snapshot(inspector_before);
+                self.last_edit = Some(std::time::Instant::now());
+                self.rebuild_mix();
             }
             if checkpoint_drag {
                 self.push_snapshot(settings_before.clone());

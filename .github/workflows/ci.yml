@@ -66,7 +66,7 @@ jobs:
           $bundleDir = Join-Path $env:RUNNER_TEMP "izotay"
           New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
           Copy-Item target/release/izotay.exe $bundleDir
-          Copy-Item PANDUAN-PAKET.md $bundleDir
+          Copy-Item -Path PANDUAN-PAKET.md,PANDUAN-PENGGUNA.md -Destination $bundleDir
           $archive = Join-Path $env:RUNNER_TEMP "izotay-$env:RUNNER_OS-$env:RUNNER_ARCH.zip"
           Compress-Archive -Path "$bundleDir\*" -DestinationPath $archive -CompressionLevel Optimal
           "IZOTAY_PACKAGE=$archive" >> $env:GITHUB_ENV
@@ -76,7 +76,7 @@ jobs:
         run: |
           bundle_dir="$RUNNER_TEMP/izotay"
           mkdir -p "$bundle_dir"
-          cp target/release/izotay PANDUAN-PAKET.md "$bundle_dir/"
+          cp target/release/izotay PANDUAN-PAKET.md PANDUAN-PENGGUNA.md "$bundle_dir/"
           archive="$RUNNER_TEMP/izotay-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
           tar -czf "$archive" -C "$RUNNER_TEMP" izotay
           echo "IZOTAY_PACKAGE=$archive" >> "$GITHUB_ENV"
@@ -87,3 +87,34 @@ jobs:
           name: izotay-${{ runner.os }}-${{ runner.arch }}
           path: ${{ env.IZOTAY_PACKAGE }}
           if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: desktop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@v4
+
+      - name: Download platform preview packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: izotay-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release and attach packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "iZotay $GITHUB_REF_NAME" \
+              --notes-file RELEASE_NOTES.md \
+              --prerelease
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
