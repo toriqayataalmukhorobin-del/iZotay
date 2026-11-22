@@ -402,6 +402,10 @@ struct TrackSettings {
     gate_threshold_db: f32,
     #[serde(default = "default_true")]
     gate_bypass: bool,
+    #[serde(default = "default_denoise_reduction")]
+    denoise_reduction_db: f32,
+    #[serde(default = "default_true")]
+    denoise_bypass: bool,
     #[serde(default)]
     clips: Vec<ClipSettings>,
 }
@@ -413,6 +417,10 @@ struct EffectSettings {
     hum_bypass: bool,
     gate_threshold_db: f32,
     gate_bypass: bool,
+    #[serde(default = "default_denoise_reduction")]
+    denoise_reduction_db: f32,
+    #[serde(default = "default_true")]
+    denoise_bypass: bool,
 }
 impl TrackSettings {
     fn effect_settings(&self) -> EffectSettings {
@@ -423,6 +431,8 @@ impl TrackSettings {
             hum_bypass: self.hum_bypass,
             gate_threshold_db: self.gate_threshold_db,
             gate_bypass: self.gate_bypass,
+            denoise_reduction_db: self.denoise_reduction_db,
+            denoise_bypass: self.denoise_bypass,
         }
     }
     fn apply_effect_settings(&mut self, effects: &EffectSettings) {
@@ -432,6 +442,8 @@ impl TrackSettings {
         self.hum_bypass = effects.hum_bypass;
         self.gate_threshold_db = effects.gate_threshold_db;
         self.gate_bypass = effects.gate_bypass;
+        self.denoise_reduction_db = effects.denoise_reduction_db;
+        self.denoise_bypass = effects.denoise_bypass;
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -453,9 +465,59 @@ struct SessionFile {
     timeline_zoom: f32,
     #[serde(default)]
     snap_enabled: bool,
+    #[serde(default)]
+    snap_grid_enabled: bool,
+    #[serde(default = "default_snap_grid_interval")]
+    snap_grid_interval: f64,
+    #[serde(default = "default_timeline_track_height")]
+    timeline_track_height: f32,
 }
 fn default_timeline_zoom() -> f32 {
     1.0
+}
+fn default_timeline_track_height() -> f32 {
+    72.0
+}
+fn default_snap_grid_interval() -> f64 {
+    0.5
+}
+fn crossfade_overlap(
+    tracks: &[Track],
+    selected: (usize, usize),
+) -> Option<(usize, usize, usize, f64)> {
+    let track = tracks.get(selected.0)?;
+    let selected_clip = track.settings.clips.get(selected.1)?;
+    let selected_end =
+        selected_clip.position + selected_clip.source_end - selected_clip.source_start;
+    track
+        .settings
+        .clips
+        .iter()
+        .enumerate()
+        .filter_map(|(other_index, other)| {
+            if other_index == selected.1 {
+                return None;
+            }
+            let (earlier_index, earlier, later_index, later) =
+                if selected_clip.position < other.position {
+                    (selected.1, selected_clip, other_index, other)
+                } else if other.position < selected_clip.position {
+                    (other_index, other, selected.1, selected_clip)
+                } else {
+                    return None;
+                };
+            let earlier_end = earlier.position + earlier.source_end - earlier.source_start;
+            let later_end = later.position + later.source_end - later.source_start;
+            let overlap = earlier_end - later.position;
+            (overlap > 0.0 && later_end >= earlier_end).then_some((
+                selected.0,
+                earlier_index,
+                later_index,
+                overlap,
+            ))
+        })
+        .max_by(|left, right| left.3.total_cmp(&right.3))
+        .filter(|(_, _, _, overlap)| *overlap <= selected_end - selected_clip.position)
 }
 fn snap_clip_position(
     proposed: f64,
@@ -463,6 +525,7 @@ fn snap_clip_position(
     targets: &[(f64, Option<(usize, usize)>)],
     excluded_clip: (usize, usize),
     threshold_seconds: f64,
+    grid_interval: Option<f64>,
 ) -> f64 {
     let mut best_position = proposed;
     let mut best_distance = threshold_seconds;
@@ -471,6 +534,19 @@ fn snap_clip_position(
             continue;
         }
         for candidate in [*target, *target - clip_duration] {
+            let distance = (candidate - proposed).abs();
+            if distance <= best_distance {
+                best_distance = distance;
+                best_position = candidate;
+            }
+        }
+    }
+    if let Some(interval) = grid_interval.filter(|interval| interval.is_finite() && *interval > 0.0)
+    {
+        for candidate in [
+            (proposed / interval).round() * interval,
+            ((proposed + clip_duration) / interval).round() * interval - clip_duration,
+        ] {
             let distance = (candidate - proposed).abs();
             if distance <= best_distance {
                 best_distance = distance;
@@ -530,6 +606,9 @@ struct LoadedSession {
     effect_a: Option<Vec<EffectSettings>>,
     timeline_zoom: f32,
     snap_enabled: bool,
+    snap_grid_enabled: bool,
+    snap_grid_interval: f64,
+    timeline_track_height: f32,
     path: std::path::PathBuf,
     recovered: bool,
 }
@@ -654,6 +733,9 @@ struct App {
     playhead_seconds: f64,
     timeline_zoom: f32,
     snap_enabled: bool,
+    snap_grid_enabled: bool,
+    snap_grid_interval: f64,
+    timeline_track_height: f32,
     time_selection: Option<(f64, f64)>,
     selection_drag_origin: Option<f64>,
     loop_selection_enabled: bool,
@@ -700,6 +782,9 @@ impl Default for App {
             playhead_seconds: 0.0,
             timeline_zoom: 1.0,
             snap_enabled: false,
+            snap_grid_enabled: false,
+            snap_grid_interval: default_snap_grid_interval(),
+            timeline_track_height: default_timeline_track_height(),
             time_selection: None,
             selection_drag_origin: None,
             loop_selection_enabled: false,
@@ -894,6 +979,23 @@ impl App {
             self.tracks[track_index].settings.clips.remove(clip_index);
             self.rebuild_mix();
         }
+    }
+    fn make_crossfade_for_selected(&mut self) {
+        let Some(selected) = self.selected_clip else {
+            return;
+        };
+        let Some((track_index, earlier_index, later_index, overlap)) =
+            crossfade_overlap(&self.tracks, selected)
+        else {
+            return;
+        };
+        self.checkpoint();
+        let clips = &mut self.tracks[track_index].settings.clips;
+        clips[earlier_index].fade_out_seconds = overlap;
+        clips[later_index].fade_in_seconds = overlap;
+        self.last_edit = Some(std::time::Instant::now());
+        self.status = Some(format!("Crossfade {:.2} detik dibuat", overlap));
+        self.rebuild_mix();
     }
     fn add_marker(&mut self) {
         self.checkpoint();
@@ -1205,6 +1307,8 @@ impl App {
                                         hum_bypass: true,
                                         gate_threshold_db: -45.0,
                                         gate_bypass: true,
+                                        denoise_reduction_db: default_denoise_reduction(),
+                                        denoise_bypass: true,
                                         clips: vec![ClipSettings {
                                             source_start: 0.0,
                                             source_end: duration,
@@ -1287,7 +1391,7 @@ impl App {
     }
     fn write_session_to(&self, path: &std::path::Path) -> Result<(), String> {
         let session = SessionFile {
-            format_version: 10,
+            format_version: 13,
             sample_rate: self
                 .tracks
                 .first()
@@ -1301,6 +1405,9 @@ impl App {
             effect_a: self.effect_a.clone(),
             timeline_zoom: self.timeline_zoom,
             snap_enabled: self.snap_enabled,
+            snap_grid_enabled: self.snap_grid_enabled,
+            snap_grid_interval: self.snap_grid_interval,
+            timeline_track_height: self.timeline_track_height,
         };
         let bytes = serde_json::to_vec_pretty(&session).map_err(|e| e.to_string())?;
         let temp = path.with_extension("izotay.tmp");
@@ -1371,7 +1478,7 @@ impl App {
                             std::fs::read(&source_path).map_err(|error| error.to_string())?;
                         let session: SessionFile = serde_json::from_slice(&data)
                             .map_err(|error| format!("Sesi tidak valid: {error}"))?;
-                        if !(1..=10).contains(&session.format_version) {
+                        if !(1..=13).contains(&session.format_version) {
                             return Err(format!(
                                 "Versi sesi {} belum didukung",
                                 session.format_version
@@ -1396,11 +1503,27 @@ impl App {
                         {
                             return Err("Zoom timeline pada sesi tidak valid".into());
                         }
+                        if !session.timeline_track_height.is_finite()
+                            || !(52.0..=220.0).contains(&session.timeline_track_height)
+                        {
+                            return Err("Tinggi track pada sesi tidak valid".into());
+                        }
+                        if ![0.1, 0.25, 0.5, 1.0, 2.0].contains(&session.snap_grid_interval) {
+                            return Err("Interval snap grid pada sesi tidak valid".into());
+                        }
                         let mut tracks = Vec::new();
                         for mut settings in session.tracks {
                             if !matches!(settings.hum_frequency_hz, 50 | 60) {
                                 return Err(format!(
                                     "Frekuensi hum track {:?} tidak didukung",
+                                    settings.name
+                                ));
+                            }
+                            if !settings.denoise_reduction_db.is_finite()
+                                || !(0.0..=30.0).contains(&settings.denoise_reduction_db)
+                            {
+                                return Err(format!(
+                                    "Pengaturan denoise track {:?} tidak valid",
                                     settings.name
                                 ));
                             }
@@ -1477,6 +1600,8 @@ impl App {
                                 !matches!(effect.hum_frequency_hz, 50 | 60)
                                     || !effect.rumble_cutoff_hz.is_finite()
                                     || !effect.gate_threshold_db.is_finite()
+                                    || !effect.denoise_reduction_db.is_finite()
+                                    || !(0.0..=30.0).contains(&effect.denoise_reduction_db)
                             })
                         {
                             return Err("Referensi efek A/B sesi tidak valid".into());
@@ -1490,6 +1615,9 @@ impl App {
                             effect_a: session.effect_a,
                             timeline_zoom: session.timeline_zoom,
                             snap_enabled: session.snap_enabled,
+                            snap_grid_enabled: session.snap_grid_enabled,
+                            snap_grid_interval: session.snap_grid_interval,
+                            timeline_track_height: session.timeline_track_height,
                             path,
                             recovered,
                         })
@@ -1527,6 +1655,9 @@ impl App {
                     self.effect_a = loaded.effect_a;
                     self.timeline_zoom = loaded.timeline_zoom;
                     self.snap_enabled = loaded.snap_enabled;
+                    self.snap_grid_enabled = loaded.snap_grid_enabled;
+                    self.snap_grid_interval = loaded.snap_grid_interval;
+                    self.timeline_track_height = loaded.timeline_track_height;
                     self.ab_showing_a = false;
                     self.time_selection = None;
                     self.export_selection_only = false;
@@ -1865,6 +1996,34 @@ fn begin_time_selection(
     let seconds = ((pointer_x - rect_left) / pixels_per_second).clamp(0.0, duration as f32) as f64;
     *origin = Some(seconds);
     *playhead_seconds = seconds;
+}
+
+fn timeline_ruler_interval(pixels_per_second: f32) -> f64 {
+    let minimum_interval = 84.0 / pixels_per_second.max(1.0) as f64;
+    [
+        0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    ]
+    .into_iter()
+    .find(|interval| *interval >= minimum_interval)
+    .unwrap_or(1200.0)
+}
+
+fn format_ruler_time(seconds: f64) -> String {
+    if seconds >= 60.0 {
+        let minutes = (seconds / 60.0).floor() as u64;
+        let remainder = seconds - minutes as f64 * 60.0;
+        if (remainder.fract()).abs() < 0.01 {
+            format!("{minutes:02}:{remainder:02.0}")
+        } else {
+            format!("{minutes:02}:{remainder:04.1}")
+        }
+    } else if seconds.fract().abs() < 0.01 {
+        format!("{seconds:.0}s")
+    } else if seconds >= 1.0 {
+        format!("{seconds:.1}s")
+    } else {
+        format!("{seconds:.2}s")
+    }
 }
 
 fn extend_time_selection(
@@ -2358,17 +2517,81 @@ impl eframe::App for App {
                         .changed();
                 });
             }
+            let crossfade_duration = self
+                .selected_clip
+                .and_then(|selected| crossfade_overlap(&self.tracks, selected))
+                .map(|(_, _, _, overlap)| overlap);
+            if self.selected_clip.is_some() {
+                ui.horizontal(|ui| {
+                    let label = crossfade_duration.map_or_else(
+                        || "Crossfade · perlu klip overlap".to_owned(),
+                        |duration| format!("Buat crossfade · {duration:.2}s"),
+                    );
+                    if ui
+                        .add_enabled(crossfade_duration.is_some(), egui::Button::new(label))
+                        .on_hover_text(
+                            "Mengatur fade out pada klip lebih awal dan fade in pada klip yang overlap.",
+                        )
+                        .clicked()
+                    {
+                        self.make_crossfade_for_selected();
+                    }
+                });
+            }
+            let mut view_settings_changed = false;
             ui.horizontal(|ui| {
                 ui.label("Zoom timeline");
-                ui.add(
+                view_settings_changed |= ui
+                    .add(
                     egui::Slider::new(&mut self.timeline_zoom, 0.25..=4.0)
                         .logarithmic(true)
                         .custom_formatter(|value, _| format!("{:.0} px/s", value * 100.0)),
-                );
-                ui.checkbox(&mut self.snap_enabled, "Snap");
+                    )
+                    .changed();
+                view_settings_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.timeline_track_height, 52.0..=220.0)
+                            .text("Tinggi track"),
+                    )
+                    .changed();
+                view_settings_changed |= ui
+                    .checkbox(&mut self.snap_enabled, "Snap")
+                    .changed();
+                view_settings_changed |= ui
+                    .add_enabled(
+                        self.snap_enabled,
+                        egui::Checkbox::new(&mut self.snap_grid_enabled, "Grid"),
+                    )
+                    .on_hover_text("Snap ke garis grid waktu selain playhead, marker, dan klip.")
+                    .changed();
+                let grid_interval_label = format!("{:.2} s", self.snap_grid_interval);
+                view_settings_changed |= egui::ComboBox::from_id_salt("snap-grid-interval")
+                    .selected_text(grid_interval_label)
+                    .show_ui(ui, |ui| {
+                        let mut changed = false;
+                        for interval in [0.1, 0.25, 0.5, 1.0, 2.0] {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.snap_grid_interval,
+                                    interval,
+                                    format!("{interval:.2} s"),
+                                )
+                                .changed();
+                        }
+                        changed
+                    })
+                    .inner
+                    .unwrap_or(false);
             });
+            if view_settings_changed {
+                self.last_edit = Some(std::time::Instant::now());
+            }
             let pixels_per_second = 100.0 * self.timeline_zoom;
             let snap_enabled = self.snap_enabled;
+            let snap_grid_interval = self
+                .snap_grid_enabled
+                .then_some(self.snap_grid_interval);
+            let timeline_track_height = self.timeline_track_height;
             let relink_enabled = !self.relink_in_progress && !self.import_in_progress;
             let mut snap_targets: Vec<(f64, Option<(usize, usize)>)> =
                 vec![(self.playhead_seconds, None)];
@@ -2465,12 +2688,29 @@ impl eframe::App for App {
                                 .checkbox(&mut track.settings.hum_bypass, "Bypass hum")
                                 .changed();
                         });
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut track.settings.denoise_reduction_db,
+                                        0.0..=30.0,
+                                    )
+                                    .text("Denoise dB"),
+                                )
+                                .on_hover_text(
+                                    "Pengurangan noise spektral adaptif via FFmpeg. Mulai rendah lalu dengarkan hasilnya.",
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(&mut track.settings.denoise_bypass, "Bypass denoise")
+                                .changed();
+                        });
                         egui::ScrollArea::horizontal()
                             .id_salt(("timeline", index))
                             .show(ui, |ui| {
                                 let width = (duration as f32 * pixels_per_second).max(ui.available_width());
                                 let (rect, lane_response) = ui.allocate_exact_size(
-                                    egui::vec2(width, 72.0),
+                                    egui::vec2(width, timeline_track_height),
                                     egui::Sense::click_and_drag(),
                                 );
                                 if lane_response.clicked() {
@@ -2530,6 +2770,39 @@ impl eframe::App for App {
                                         egui::Color32::from_rgba_unmultiplied(80, 145, 220, 65),
                                     );
                                 }
+                                let ruler_height = 18.0;
+                                let ruler_rect = egui::Rect::from_min_max(
+                                    rect.left_top(),
+                                    egui::pos2(rect.right(), rect.top() + ruler_height),
+                                );
+                                painter.rect_filled(
+                                    ruler_rect,
+                                    3.0,
+                                    egui::Color32::from_rgb(28, 42, 51),
+                                );
+                                let ruler_interval = timeline_ruler_interval(pixels_per_second);
+                                let tick_count = (duration / ruler_interval).ceil() as usize;
+                                for tick in 0..=tick_count {
+                                    let time = tick as f64 * ruler_interval;
+                                    let x = rect.left() + time as f32 * pixels_per_second;
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(x, rect.top() + 12.0),
+                                            egui::pos2(x, rect.bottom()),
+                                        ],
+                                        (
+                                            1.0,
+                                            egui::Color32::from_rgba_unmultiplied(93, 119, 130, 48),
+                                        ),
+                                    );
+                                    painter.text(
+                                        egui::pos2(x + 4.0, rect.top() + 1.0),
+                                        egui::Align2::LEFT_TOP,
+                                        format_ruler_time(time),
+                                        egui::FontId::proportional(10.0),
+                                        egui::Color32::from_rgb(170, 190, 198),
+                                    );
+                                }
                                 let xhead = rect.left() + self.playhead_seconds as f32 * pixels_per_second;
                                 painter.line_segment(
                                     [
@@ -2575,7 +2848,7 @@ impl eframe::App for App {
                                             as f32
                                             * pixels_per_second;
                                     let clip_rect = egui::Rect::from_min_max(
-                                        egui::pos2(left, rect.top() + 5.0),
+                                        egui::pos2(left, rect.top() + 22.0),
                                         egui::pos2(right.max(left + 12.0), rect.bottom() - 5.0),
                                     );
                                     let response = ui.interact(
@@ -2641,6 +2914,7 @@ impl eframe::App for App {
                                                     &snap_targets,
                                                     (index, clip_index),
                                                     8.0 / pixels_per_second as f64,
+                                                    snap_grid_interval,
                                                 )
                                             } else {
                                                 proposed_position
@@ -2792,12 +3066,148 @@ fn default_gate_threshold() -> f32 {
     -45.0
 }
 
+fn default_denoise_reduction() -> f32 {
+    12.0
+}
+
 fn default_hum_frequency() -> u32 {
     50
 }
 
 fn default_export_bit_depth() -> u16 {
     24
+}
+
+fn denoise_samples_controlled(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    reduction_db: f32,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<f32>, String> {
+    if channels == 0 || sample_rate == 0 || samples.is_empty() {
+        return Ok(samples.to_vec());
+    }
+    if !reduction_db.is_finite() || !(0.0..=30.0).contains(&reduction_db) {
+        return Err("Pengaturan denoise tidak valid".into());
+    }
+    let filter = format!("afftdn=nr={reduction_db:.1}:nf=-50:tn=1");
+    let mut child = std::process::Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-f",
+            "f32le",
+            "-ar",
+        ])
+        .arg(sample_rate.to_string())
+        .arg("-ac")
+        .arg(channels.to_string())
+        .args(["-i", "pipe:0", "-af"])
+        .arg(filter)
+        .args(["-f", "f32le", "pipe:1"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "FFmpeg diperlukan untuk denoise. Pasang FFmpeg lalu coba lagi.".to_owned()
+            } else {
+                format!("Gagal menjalankan FFmpeg denoise: {error}")
+            }
+        })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Output FFmpeg denoise tidak tersedia".to_owned())?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).map(|_| bytes)
+    });
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Log FFmpeg denoise tidak tersedia".to_owned())?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stderr, &mut bytes).map(|_| bytes)
+    });
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Input FFmpeg denoise tidak tersedia".to_owned())?;
+    let write_result = (|| -> Result<(), String> {
+        for chunk in samples.chunks(16_384) {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err("Render mix dibatalkan".into());
+            }
+            let mut bytes = Vec::with_capacity(chunk.len() * 4);
+            for sample in chunk {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            std::io::Write::write_all(&mut input, &bytes)
+                .map_err(|error| format!("Gagal mengirim audio ke FFmpeg: {error}"))?;
+        }
+        Ok(())
+    })();
+    drop(input);
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        return Err(error);
+    }
+    loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("Render mix dibatalkan".into());
+        }
+        if child
+            .try_wait()
+            .map_err(|error| format!("Gagal menunggu FFmpeg denoise: {error}"))?
+            .is_some()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("Gagal menunggu FFmpeg denoise: {error}"))?;
+    let output = stdout_reader
+        .join()
+        .map_err(|_| "Pembaca output FFmpeg berhenti tiba-tiba".to_owned())?
+        .map_err(|error| format!("Gagal membaca hasil denoise: {error}"))?;
+    let error_output = stderr_reader
+        .join()
+        .map_err(|_| "Pembaca log FFmpeg berhenti tiba-tiba".to_owned())?
+        .map_err(|error| format!("Gagal membaca log FFmpeg: {error}"))?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&error_output);
+        return Err(format!(
+            "FFmpeg tidak dapat memproses denoise: {}",
+            detail.trim()
+        ));
+    }
+    if output.len() % 4 != 0 || output.len() / 4 != samples.len() {
+        return Err("FFmpeg menghasilkan durasi audio denoise yang tidak sesuai".into());
+    }
+    Ok(output
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|sample| {
+            let value = f32::from_le_bytes(*sample);
+            if value.is_finite() { value } else { 0.0 }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -2876,6 +3286,15 @@ fn prepare_mix_playback(
                 track.audio.sample_rate,
                 track.settings.gate_threshold_db,
                 false,
+                cancelled,
+            )?);
+        }
+        if !track.settings.denoise_bypass && track.settings.denoise_reduction_db > 0.0 {
+            samples = Arc::new(denoise_samples_controlled(
+                &samples,
+                channels,
+                track.audio.sample_rate,
+                track.settings.denoise_reduction_db,
                 cancelled,
             )?);
         }
@@ -3483,6 +3902,8 @@ mod tests {
                 hum_bypass: true,
                 gate_threshold_db: -45.0,
                 gate_bypass: true,
+                denoise_reduction_db: 12.0,
+                denoise_bypass: true,
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,

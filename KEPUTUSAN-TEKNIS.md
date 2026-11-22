@@ -16,8 +16,11 @@ Status: prototipe editor multi-track tahap 1 dengan beberapa fondasi tahap 2; be
 - Impor beberapa berkas audio atau video sebagai track; audio video ditampilkan sebagai waveform tanpa mengubah gambar atau sumber aslinya. Nama track dapat diubah, urutannya dapat dipindah, dan waveform, mute/solo, gain, serta pan tersedia.
 - Timeline dasar dengan playhead, pindah/duplikasi klip, split pada playhead, trim awal/akhir, hapus klip/track, serta undo/redo sampai 100 langkah.
 - Zoom timeline horizontal dapat diatur dari 25 hingga 400 piksel per detik; posisi playhead, marker, seleksi, dan drag klip mengikuti skala yang sama. Pengaturan zoom disimpan per sesi.
-- Snap opsional saat memindahkan klip mengunci tepi klip ke playhead, marker, atau tepi klip lain dalam jarak 8 piksel; status snap disimpan per sesi.
+- Tinggi lane waveform dapat diatur dari 52 hingga 220 piksel; pilihan disimpan per sesi.
+- Ruler waktu menampilkan label dan garis panduan dengan interval yang menyesuaikan zoom horizontal.
+- Snap opsional saat memindahkan klip mengunci tepi klip ke playhead, marker, tepi klip lain, atau grid waktu 0,1/0,25/0,5/1/2 detik dalam jarak 8 piksel; pengaturan disimpan per sesi.
 - Gain klip 0–4× dan fade in/out linear non-destruktif; parameter tersimpan di sesi, dapat di-undo, serta dipakai untuk playback, meter track, dan ekspor. Klip hasil split mewarisi gain.
+- Crossfade dapat dibuat untuk klip terpilih yang overlap dengan klip setelahnya; fade out/in diselaraskan ke rentang overlap dan dapat di-undo.
 - Seleksi rentang waktu lewat seret pada area kosong timeline atau Shift+seret klip; rentang dapat di-loop untuk preview dan dipakai untuk ekspor mix atau track.
 - Shortcut Space untuk playback, S untuk split, Ctrl/Cmd+D untuk duplikasi, dan Ctrl/Cmd+Z/Y untuk undo/redo.
 - Marker timeline dengan label otomatis; klik marker untuk memindahkan playhead. Marker ikut tersimpan dan dipulihkan oleh undo/redo.
@@ -26,10 +29,11 @@ Status: prototipe editor multi-track tahap 1 dengan beberapa fondasi tahap 2; be
 - Impor/decode WAV, pembukaan sesi, penghitungan filter/mix, dan render ekspor berjalan di worker latar belakang. Antrean mix hanya menyimpan permintaan terbaru dan membatalkan render lama saat pengaturan berubah.
 - High-pass rumble per track dengan rentang 0–180 Hz dan bypass untuk perbandingan cepat. Filter satu pole diproses dari salinan buffer, bukan sumber.
 - Hum removal per track dengan pilihan listrik 50/60 Hz, notch sempit pada fundamental dan sampai delapan harmonik, serta bypass.
+- Denoise spektral adaptif per track melalui FFmpeg `afftdn`, pengurangan 0–30 dB, bypass, A/B, dan loop seleksi untuk mendengar hasil; sumber tetap utuh.
 - Perbandingan A/B untuk parameter rumble, hum, dan expander per track; set A tersimpan dalam sesi sementara kontrol tetap mengedit set B.
 - Expander per track dengan threshold -60 hingga -20 dBFS, bypass, penurunan level konservatif sekitar 15 dB, attack 10 ms, dan release 120 ms.
 - Meter peak master live menampilkan level linear dan dBFS dari callback output; meter per track menunjukkan peak pada jendela 10 ms di sekitar playhead.
-- Simpan/buka sesi `.izotay` versi 10; versi 1–9 tetap dibaca. Gain klip baru memakai default 1×, zoom memakai nilai default, dan snap nonaktif pada sesi lama. Pengaturan ekspor dan set A ikut disimpan. Sumber media direferensikan lewat path, bukan disalin ke sesi.
+- Simpan/buka sesi `.izotay` versi 13; versi 1–12 tetap dibaca. Gain klip baru memakai default 1×, zoom memakai nilai default, snap nonaktif, dan tinggi lane memakai nilai default pada sesi lama. Pengaturan ekspor dan set A ikut disimpan. Sumber media direferensikan lewat path, bukan disalin ke sesi.
 - Sesi tetap dapat dibuka saat sumber tidak tersedia; track ditandai offline dan dapat ditautkan ulang lewat dialog file. Klip yang melewati durasi sumber baru dipangkas ke rentang valid.
 - Mix menggunakan sample rate track pertama; sumber dan playback perangkat memakai interpolasi linear saat menyamakan laju sampel.
 
@@ -41,9 +45,9 @@ Status: prototipe editor multi-track tahap 1 dengan beberapa fondasi tahap 2; be
 - Ekspor track menerapkan efek yang sedang aktif. Pembatalan diperiksa selama filter dan penulisan, tetapi operasi sistem berkas saat mengganti file tidak dapat dihentikan di tengah.
 - Normalisasi mengukur peak sample pada rentang ekspor, bukan loudness LUFS; boost dibatasi 40 dB agar rekaman sangat pelan tidak dinaikkan tanpa batas.
 - Notch hum dapat mengurangi komponen suara yang kebetulan berada dekat harmoniknya; bypass tersedia, dan hasil tetap perlu didengar pada rekaman sasaran.
-- Preview DSP yang dibatasi ke seleksi, denoise, dan kompensasi artefak belum tersedia; expander perlu diuji pada dialog pelan sebelum dipakai di produksi.
+- Denoise memerlukan build FFmpeg dengan filter `afftdn`; profil noise belum dapat diambil dari seleksi, dan pemrosesan diterapkan pada seluruh track. Expander perlu diuji pada dialog pelan sebelum dipakai di produksi.
 - Playback menghitung mix per frame di callback audio dan tidak menyimpan buffer mix penuh. Sumber masih dimuat seluruhnya di memori; daftar klip yang sangat padat dapat menambah beban callback.
-- Snap ke grid waktu, preview gambar video, dan pengubahan tinggi track belum tersedia. Loop hanya mengulang rentang waktu yang dipilih.
+- Preview gambar video belum tersedia. Loop hanya mengulang rentang waktu yang dipilih; filter restorasi bekerja pada seluruh track saat render mix.
 - Meter live master dibaca dari callback output; meter track menampilkan peak pada jendela 10 ms di sekitar playhead.
 - Batas loop belum memakai crossfade; pilih rentang dengan transisi yang bersih untuk menghindari klik.
 - Relink memangkas klip yang sumbernya melebihi durasi berkas yang dipilih; kecocokan identitas media belum diverifikasi otomatis.
@@ -54,5 +58,5 @@ Status: prototipe editor multi-track tahap 1 dengan beberapa fondasi tahap 2; be
 
 1. Uji impor, sesi, playback, dan ekspor pada aplikasi berjalan dengan WAV mono/stereo, PCM 16/24/32-bit, float, serta sample rate berbeda.
 2. Tambahkan pembacaan media bertahap dan cache waveform agar sesi panjang tidak memerlukan seluruh sumber di memori.
-3. Tambahkan preview A/B seleksi dan denoise.
+3. Tambahkan pengambilan profil noise dari seleksi dan batasi render preview restorasi ke rentang yang sedang diperiksa.
 4. Uji sistem operasi sasaran, latensi, lisensi, dan packaging sebelum teknologi dianggap final.
