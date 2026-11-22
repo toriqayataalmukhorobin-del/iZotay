@@ -1520,6 +1520,7 @@ dependencies = [
  "cpal",
  "eframe",
  "hound",
+ "memmap2",
  "rfd",
  "serde",
  "serde_json",

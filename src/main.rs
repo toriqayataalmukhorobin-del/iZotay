@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
@@ -13,18 +14,107 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 struct Audio {
-    samples: Arc<Vec<f32>>,
+    samples: Arc<SampleBuffer>,
     sample_rate: u32,
     channels: u16,
 }
+enum SampleStorage {
+    Owned(Vec<f32>),
+    Mapped(memmap2::Mmap),
+}
+struct SampleBuffer {
+    storage: SampleStorage,
+    len: usize,
+}
+impl SampleBuffer {
+    fn owned(samples: Vec<f32>) -> Self {
+        let len = samples.len();
+        Self {
+            storage: SampleStorage::Owned(samples),
+            len,
+        }
+    }
+
+    fn mapped(path: &std::path::Path, channels: usize) -> Result<Self, String> {
+        #[cfg(target_endian = "big")]
+        {
+            let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+            if bytes.len() % 4 != 0 || !(bytes.len() / 4).is_multiple_of(channels.max(1)) {
+                return Err("Cache sampel memiliki panjang yang tidak valid".into());
+            }
+            let samples = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
+                .collect();
+            return Ok(Self::owned(samples));
+        }
+        #[cfg(target_endian = "little")]
+        {
+            let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+            let map = unsafe { memmap2::MmapOptions::new().map(&file) }
+                .map_err(|error| format!("Tidak dapat memetakan cache sampel: {error}"))?;
+            if map.len() % std::mem::size_of::<f32>() != 0
+                || !(map.len() / std::mem::size_of::<f32>()).is_multiple_of(channels.max(1))
+            {
+                return Err("Cache sampel memiliki panjang yang tidak valid".into());
+            }
+            let len = map.len() / std::mem::size_of::<f32>();
+            Ok(Self {
+                storage: SampleStorage::Mapped(map),
+                len,
+            })
+        }
+    }
+}
+impl std::ops::Deref for SampleBuffer {
+    type Target = [f32];
+
+    fn deref(&self) -> &Self::Target {
+        match &self.storage {
+            SampleStorage::Owned(samples) => samples,
+            SampleStorage::Mapped(map) => {
+                // SAFETY: sample cache files are written as contiguous little-endian f32 values;
+                // the mapping starts page-aligned and its length was checked above.
+                unsafe { std::slice::from_raw_parts(map.as_ptr().cast::<f32>(), self.len) }
+            }
+        }
+    }
+}
 struct PreparedTrack {
     source_index: usize,
-    samples: Arc<Vec<f32>>,
+    samples: Arc<SampleBuffer>,
+    processed_regions: Vec<ProcessedRegion>,
+    preview_range: Option<(f64, f64)>,
     channels: usize,
     sample_rate: u32,
     gain_left: f32,
     gain_right: f32,
     clips: Vec<ClipSettings>,
+}
+struct ProcessedRegion {
+    start_frame: usize,
+    samples: Arc<Vec<f32>>,
+}
+impl PreparedTrack {
+    fn sample(&self, frame: usize, channel: usize, time: f64) -> f32 {
+        if self
+            .preview_range
+            .is_some_and(|(start, end)| time >= start && time < end)
+            && let Some(region) = self.processed_regions.iter().find(|region| {
+                frame >= region.start_frame
+                    && frame < region.start_frame + region.samples.len() / self.channels
+            })
+        {
+            let index =
+                (frame - region.start_frame) * self.channels + channel.min(self.channels - 1);
+            if let Some(sample) = region.samples.get(index) {
+                return *sample;
+            }
+        }
+        self.samples[frame * self.channels + channel.min(self.channels - 1)]
+    }
 }
 struct MixPlayback {
     tracks: Vec<PreparedTrack>,
@@ -78,9 +168,8 @@ impl MixPlayback {
                 let high = (low + 1).min(source_frames - 1);
                 let fraction = (source_position - low as f64) as f32;
                 let sample = |channel: usize| {
-                    let index = channel.min(track.channels - 1);
-                    let a = track.samples[low * track.channels + index];
-                    let b = track.samples[high * track.channels + index];
+                    let a = track.sample(low, channel, time);
+                    let b = track.sample(high, channel, time);
                     a + (b - a) * fraction
                 };
                 let left = sample(0);
@@ -121,9 +210,8 @@ impl MixPlayback {
             let high = (low + 1).min(source_frames.saturating_sub(1));
             let fraction = (source_position - low as f64) as f32;
             let sample = |channel: usize| {
-                let channel = channel.min(track.channels - 1);
-                let a = track.samples[low * track.channels + channel];
-                let b = track.samples[high * track.channels + channel];
+                let a = track.sample(low, channel, time);
+                let b = track.sample(high, channel, time);
                 a + (b - a) * fraction
             };
             let fade_in = if clip.fade_in_seconds > 0.0 {
@@ -407,6 +495,8 @@ struct TrackSettings {
     #[serde(default = "default_true")]
     denoise_bypass: bool,
     #[serde(default)]
+    denoise_profile_range: Option<(f64, f64)>,
+    #[serde(default)]
     clips: Vec<ClipSettings>,
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -421,6 +511,8 @@ struct EffectSettings {
     denoise_reduction_db: f32,
     #[serde(default = "default_true")]
     denoise_bypass: bool,
+    #[serde(default)]
+    denoise_profile_range: Option<(f64, f64)>,
 }
 impl TrackSettings {
     fn effect_settings(&self) -> EffectSettings {
@@ -433,6 +525,7 @@ impl TrackSettings {
             gate_bypass: self.gate_bypass,
             denoise_reduction_db: self.denoise_reduction_db,
             denoise_bypass: self.denoise_bypass,
+            denoise_profile_range: self.denoise_profile_range,
         }
     }
     fn apply_effect_settings(&mut self, effects: &EffectSettings) {
@@ -444,6 +537,7 @@ impl TrackSettings {
         self.gate_bypass = effects.gate_bypass;
         self.denoise_reduction_db = effects.denoise_reduction_db;
         self.denoise_bypass = effects.denoise_bypass;
+        self.denoise_profile_range = effects.denoise_profile_range;
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -480,6 +574,32 @@ fn default_timeline_track_height() -> f32 {
 }
 fn default_snap_grid_interval() -> f64 {
     0.5
+}
+fn noise_profile_range(clips: &[ClipSettings], selection: (f64, f64)) -> Option<(f64, f64)> {
+    let (selection_start, selection_end) = selection;
+    clips
+        .iter()
+        .filter_map(|clip| {
+            let clip_duration = clip.source_end - clip.source_start;
+            let start = selection_start.max(clip.position);
+            let end = selection_end.min(clip.position + clip_duration);
+            (end > start).then_some((
+                clip.source_start + start - clip.position,
+                clip.source_start + end - clip.position,
+            ))
+        })
+        .filter(|(start, end)| start.is_finite() && end.is_finite() && end - start >= 0.5)
+        .max_by(|left, right| (left.1 - left.0).total_cmp(&(right.1 - right.0)))
+}
+fn clamp_noise_profile_range(
+    range: Option<(f64, f64)>,
+    source_duration: f64,
+) -> Option<(f64, f64)> {
+    range.and_then(|(start, end)| {
+        let start = start.max(0.0).min(source_duration);
+        let end = end.max(0.0).min(source_duration);
+        (end > start).then_some((start, end))
+    })
 }
 fn crossfade_overlap(
     tracks: &[Track],
@@ -560,8 +680,17 @@ fn snap_clip_position(
 struct Track {
     settings: TrackSettings,
     audio: Audio,
-    peaks: Vec<f32>,
+    waveform: Arc<WaveformCache>,
     offline: bool,
+}
+#[derive(Clone, Default)]
+struct WaveformCache {
+    levels: Vec<PeakLevel>,
+}
+#[derive(Clone)]
+struct PeakLevel {
+    window_frames: usize,
+    peaks: Vec<f32>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Marker {
@@ -578,6 +707,7 @@ struct EditorSnapshot {
 struct MixRequest {
     generation: u64,
     tracks: Vec<Track>,
+    preview_range: Option<(f64, f64)>,
 }
 struct MixResponse {
     generation: u64,
@@ -591,11 +721,12 @@ struct MixRender {
 struct ImportResult {
     tracks: Vec<Track>,
     errors: Vec<String>,
+    cancelled: bool,
 }
 struct RelinkResult {
     track_index: usize,
     path: std::path::PathBuf,
-    result: Result<Audio, String>,
+    result: Result<(Audio, Arc<WaveformCache>), String>,
 }
 struct LoadedSession {
     tracks: Vec<Track>,
@@ -659,7 +790,11 @@ impl MixWorker {
                         (request, cancelled)
                     };
                     let (request, cancelled) = request;
-                    let result = render_mix_internal(&request.tracks, Some(&cancelled));
+                    let result = render_mix_internal(
+                        &request.tracks,
+                        Some(&cancelled),
+                        request.preview_range,
+                    );
                     {
                         let (slot, _) = &*worker_pending;
                         let mut guard = slot.lock().unwrap();
@@ -736,6 +871,8 @@ struct App {
     snap_grid_enabled: bool,
     snap_grid_interval: f64,
     timeline_track_height: f32,
+    preview_selection_only: bool,
+    mix_preview_range: Option<(f64, f64)>,
     time_selection: Option<(f64, f64)>,
     selection_drag_origin: Option<f64>,
     loop_selection_enabled: bool,
@@ -758,6 +895,7 @@ struct App {
     export_selection_only: bool,
     import_result: Option<Receiver<ImportResult>>,
     import_in_progress: bool,
+    import_cancel: Option<Arc<AtomicBool>>,
     relink_result: Option<Receiver<RelinkResult>>,
     relink_in_progress: bool,
     session_result: Option<Receiver<Result<LoadedSession, String>>>,
@@ -785,6 +923,8 @@ impl Default for App {
             snap_grid_enabled: false,
             snap_grid_interval: default_snap_grid_interval(),
             timeline_track_height: default_timeline_track_height(),
+            preview_selection_only: false,
+            mix_preview_range: None,
             time_selection: None,
             selection_drag_origin: None,
             loop_selection_enabled: false,
@@ -807,6 +947,7 @@ impl Default for App {
             export_selection_only: false,
             import_result: None,
             import_in_progress: false,
+            import_cancel: None,
             relink_result: None,
             relink_in_progress: false,
             session_result: None,
@@ -1039,7 +1180,16 @@ impl App {
             std::thread::Builder::new()
                 .name("izotay-relink".into())
                 .spawn(move || {
-                    let result = read_media_audio(&worker_path);
+                    let result = read_media_audio(&worker_path).and_then(|audio| {
+                        let waveform = cached_peak_pyramid_controlled(
+                            &worker_path,
+                            &audio.samples,
+                            audio.channels as usize,
+                            audio.sample_rate,
+                            None,
+                        )?;
+                        Ok((audio, waveform))
+                    });
                     let _ = sender.send(RelinkResult {
                         track_index: index,
                         path: worker_path,
@@ -1067,7 +1217,7 @@ impl App {
             self.relink_result = None;
             self.relink_in_progress = false;
             match result.result {
-                Ok(audio) if result.track_index < self.tracks.len() => {
+                Ok((audio, waveform)) if result.track_index < self.tracks.len() => {
                     self.checkpoint();
                     let track = &mut self.tracks[result.track_index];
                     let source_duration = audio.samples.len() as f64
@@ -1084,10 +1234,24 @@ impl App {
                         .settings
                         .clips
                         .retain(|clip| clip.source_end > clip.source_start);
+                    track.settings.denoise_profile_range = clamp_noise_profile_range(
+                        track.settings.denoise_profile_range,
+                        source_duration,
+                    );
                     track.settings.path = result.path.display().to_string();
-                    track.peaks = peak_data(&audio.samples, audio.channels as usize, 700);
+                    track.waveform = waveform;
                     track.audio = audio;
                     track.offline = false;
+                    if let Some(effect) = self
+                        .effect_a
+                        .as_mut()
+                        .and_then(|effects| effects.get_mut(result.track_index))
+                    {
+                        effect.denoise_profile_range = clamp_noise_profile_range(
+                            effect.denoise_profile_range,
+                            source_duration,
+                        );
+                    }
                     self.error = None;
                     self.status = Some(
                         "Media ditautkan ulang; rentang di luar durasi sumber dipotong".into(),
@@ -1118,6 +1282,7 @@ impl App {
             self.mix_peaks.clear();
             self.mix_clips = false;
             self.mix_pending = false;
+            self.mix_preview_range = None;
             return;
         }
         self.mix_pending = true;
@@ -1132,7 +1297,17 @@ impl App {
         self.mix_worker.submit(MixRequest {
             generation: self.mix_generation,
             tracks: mix_tracks,
+            preview_range: if self.preview_selection_only {
+                self.time_selection
+            } else {
+                None
+            },
         });
+        self.mix_preview_range = if self.preview_selection_only {
+            self.time_selection
+        } else {
+            None
+        };
     }
     fn poll_mix(&mut self) {
         while let Ok(response) = self.mix_worker.responses.try_recv() {
@@ -1275,15 +1450,22 @@ impl App {
                 return;
             }
             let (sender, receiver) = mpsc::channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = cancel.clone();
             std::thread::Builder::new()
                 .name("izotay-import".into())
                 .spawn(move || {
                     let mut result = ImportResult {
                         tracks: Vec::new(),
                         errors: Vec::new(),
+                        cancelled: false,
                     };
                     for path in paths {
-                        match read_media_audio(&path) {
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            result.cancelled = true;
+                            break;
+                        }
+                        match read_media_audio_controlled(&path, Some(&worker_cancel)) {
                             Ok(audio) => {
                                 let name = path
                                     .file_stem()
@@ -1293,6 +1475,23 @@ impl App {
                                 let duration = audio.samples.len() as f64
                                     / audio.channels as f64
                                     / audio.sample_rate as f64;
+                                let waveform = match cached_peak_pyramid_controlled(
+                                    &path,
+                                    &audio.samples,
+                                    audio.channels as usize,
+                                    audio.sample_rate,
+                                    Some(&worker_cancel),
+                                ) {
+                                    Ok(waveform) => waveform,
+                                    Err(error) if error == "Impor dibatalkan" => {
+                                        result.cancelled = true;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        result.errors.push(format!("{}: {error}", path.display()));
+                                        continue;
+                                    }
+                                };
                                 result.tracks.push(Track {
                                     settings: TrackSettings {
                                         name,
@@ -1309,6 +1508,7 @@ impl App {
                                         gate_bypass: true,
                                         denoise_reduction_db: default_denoise_reduction(),
                                         denoise_bypass: true,
+                                        denoise_profile_range: None,
                                         clips: vec![ClipSettings {
                                             source_start: 0.0,
                                             source_end: duration,
@@ -1318,10 +1518,14 @@ impl App {
                                             gain: 1.0,
                                         }],
                                     },
-                                    peaks: peak_data(&audio.samples, audio.channels as usize, 700),
+                                    waveform,
                                     audio,
                                     offline: false,
                                 });
+                            }
+                            Err(error) if error == "Impor dibatalkan" => {
+                                result.cancelled = true;
+                                break;
                             }
                             Err(error) => {
                                 result.errors.push(format!("{}: {error}", path.display()))
@@ -1333,8 +1537,15 @@ impl App {
                 .expect("gagal membuat worker impor");
             self.import_result = Some(receiver);
             self.import_in_progress = true;
+            self.import_cancel = Some(cancel);
             self.status = Some("Membaca audio/video di latar belakang".into());
         }
+    }
+    fn cancel_import(&mut self) {
+        if let Some(cancel) = &self.import_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.status = Some("Membatalkan impor; track yang sudah selesai akan dipertahankan".into());
     }
     fn poll_import(&mut self) {
         let result = match self.import_result.as_ref().map(Receiver::try_recv) {
@@ -1342,6 +1553,7 @@ impl App {
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.import_result = None;
                 self.import_in_progress = false;
+                self.import_cancel = None;
                 self.error = Some("Worker impor berhenti sebelum selesai".into());
                 None
             }
@@ -1350,6 +1562,8 @@ impl App {
         if let Some(mut result) = result {
             self.import_result = None;
             self.import_in_progress = false;
+            self.import_cancel = None;
+            let imported_count = result.tracks.len();
             if !result.tracks.is_empty() {
                 self.checkpoint();
                 let start = self.tracks.len();
@@ -1358,13 +1572,26 @@ impl App {
                 self.selected_clip = Some((start, 0));
                 self.rebuild_mix();
             }
-            if result.errors.is_empty() {
-                self.error = None;
-            } else {
+            if !result.errors.is_empty() {
                 self.error = Some(result.errors.join("; "));
+            } else {
+                self.error = None;
             }
-            if !self.tracks.is_empty() && result.errors.is_empty() {
+            if result.cancelled {
+                self.status = Some(format!(
+                    "Impor dibatalkan; {} track yang sudah selesai tetap dipertahankan",
+                    imported_count
+                ));
+            } else if !result.errors.is_empty() && imported_count > 0 {
+                self.status = Some(format!(
+                    "Impor selesai sebagian; {imported_count} track berhasil dimuat"
+                ));
+            } else if !result.errors.is_empty() {
+                self.status = Some("Impor gagal; periksa rincian kesalahan".into());
+            } else if imported_count > 0 {
                 self.status = Some("Media berhasil diimpor".into());
+            } else {
+                self.status = Some("Tidak ada media yang diimpor".into());
             }
         }
     }
@@ -1391,7 +1618,7 @@ impl App {
     }
     fn write_session_to(&self, path: &std::path::Path) -> Result<(), String> {
         let session = SessionFile {
-            format_version: 13,
+            format_version: 14,
             sample_rate: self
                 .tracks
                 .first()
@@ -1476,9 +1703,9 @@ impl App {
                     let result = (|| -> Result<LoadedSession, String> {
                         let data =
                             std::fs::read(&source_path).map_err(|error| error.to_string())?;
-                        let session: SessionFile = serde_json::from_slice(&data)
+                        let mut session: SessionFile = serde_json::from_slice(&data)
                             .map_err(|error| format!("Sesi tidak valid: {error}"))?;
-                        if !(1..=13).contains(&session.format_version) {
+                        if !(1..=14).contains(&session.format_version) {
                             return Err(format!(
                                 "Versi sesi {} belum didukung",
                                 session.format_version
@@ -1527,12 +1754,23 @@ impl App {
                                     settings.name
                                 ));
                             }
+                            if settings.denoise_profile_range.is_some_and(|(start, end)| {
+                                !start.is_finite()
+                                    || !end.is_finite()
+                                    || start < 0.0
+                                    || end <= start
+                            }) {
+                                return Err(format!(
+                                    "Profil noise track {:?} tidak valid",
+                                    settings.name
+                                ));
+                            }
                             let (audio, offline) =
                                 match read_media_audio(std::path::Path::new(&settings.path)) {
                                     Ok(audio) => (audio, false),
                                     Err(_) => (
                                         Audio {
-                                            samples: Arc::new(Vec::new()),
+                                            samples: Arc::new(SampleBuffer::owned(Vec::new())),
                                             sample_rate: session.sample_rate,
                                             channels: 2,
                                         },
@@ -1562,6 +1800,10 @@ impl App {
                                 settings
                                     .clips
                                     .retain(|clip| clip.source_end > clip.source_start);
+                                settings.denoise_profile_range = clamp_noise_profile_range(
+                                    settings.denoise_profile_range,
+                                    source_duration,
+                                );
                             }
                             for clip in &mut settings.clips {
                                 if !clip.fade_in_seconds.is_finite()
@@ -1582,7 +1824,13 @@ impl App {
                                 clip.fade_out_seconds = clip.fade_out_seconds.min(duration);
                             }
                             tracks.push(Track {
-                                peaks: peak_data(&audio.samples, audio.channels as usize, 700),
+                                waveform: cached_peak_pyramid_controlled(
+                                    std::path::Path::new(&settings.path),
+                                    &audio.samples,
+                                    audio.channels as usize,
+                                    audio.sample_rate,
+                                    None,
+                                )?,
                                 audio,
                                 settings,
                                 offline,
@@ -1602,9 +1850,28 @@ impl App {
                                     || !effect.gate_threshold_db.is_finite()
                                     || !effect.denoise_reduction_db.is_finite()
                                     || !(0.0..=30.0).contains(&effect.denoise_reduction_db)
+                                    || effect.denoise_profile_range.is_some_and(|(start, end)| {
+                                        !start.is_finite()
+                                            || !end.is_finite()
+                                            || start < 0.0
+                                            || end <= start
+                                    })
                             })
                         {
                             return Err("Referensi efek A/B sesi tidak valid".into());
+                        }
+                        if let Some(effects) = &mut session.effect_a {
+                            for (effect, track) in effects.iter_mut().zip(&tracks) {
+                                if !track.offline {
+                                    let source_duration = track.audio.samples.len() as f64
+                                        / track.audio.channels.max(1) as f64
+                                        / track.audio.sample_rate.max(1) as f64;
+                                    effect.denoise_profile_range = clamp_noise_profile_range(
+                                        effect.denoise_profile_range,
+                                        source_duration,
+                                    );
+                                }
+                            }
                         }
                         Ok(LoadedSession {
                             tracks,
@@ -1928,6 +2195,50 @@ impl App {
         if let Some(player) = &self.player {
             player.set_loop(range);
         }
+    }
+    fn capture_denoise_profile(&mut self, track_index: usize) {
+        let Some(selection) = self.time_selection else {
+            self.error = Some("Pilih dulu area yang hanya berisi noise latar".into());
+            return;
+        };
+        let Some(track) = self.tracks.get(track_index) else {
+            self.error = Some("Track untuk profil noise tidak ditemukan".into());
+            return;
+        };
+        if track.offline {
+            self.error = Some("Tautkan ulang track sebelum mengambil profil noise".into());
+            return;
+        }
+        let Some(profile_range) = noise_profile_range(&track.settings.clips, selection) else {
+            self.error =
+                Some("Seleksi harus mencakup minimal 0,5 detik audio pada track ini".into());
+            return;
+        };
+        self.checkpoint();
+        let track = &mut self.tracks[track_index];
+        track.settings.denoise_profile_range = Some(profile_range);
+        track.settings.denoise_bypass = false;
+        self.ab_showing_a = false;
+        self.error = None;
+        self.status = Some(format!(
+            "Rentang profil noise {:.2}s tersimpan; dipreview di seluruh track",
+            profile_range.1 - profile_range.0
+        ));
+        self.rebuild_mix();
+    }
+    fn clear_denoise_profile(&mut self, track_index: usize) {
+        let Some(track) = self.tracks.get(track_index) else {
+            return;
+        };
+        if track.settings.denoise_profile_range.is_none() {
+            return;
+        }
+        self.checkpoint();
+        self.tracks[track_index].settings.denoise_profile_range = None;
+        self.ab_showing_a = false;
+        self.last_edit = Some(std::time::Instant::now());
+        self.status = Some("Profil noise dihapus; denoise memakai tracking adaptif".into());
+        self.rebuild_mix();
     }
     fn capture_effect_a(&mut self) {
         self.effect_a = Some(
@@ -2365,6 +2676,13 @@ impl eframe::App for App {
                             self.export_selection_only = false;
                             self.loop_selection_enabled = false;
                         }
+                        ui.checkbox(
+                            &mut self.preview_selection_only,
+                            "Efek di seleksi saja",
+                        )
+                        .on_hover_text(
+                            "Untuk preview, restorasi hanya dirender pada rentang terpilih. Ekspor tetap memakai efek untuk seluruh track.",
+                        );
                     }
                 });
             });
@@ -2372,6 +2690,7 @@ impl eframe::App for App {
         if export_settings_changed {
             self.last_edit = Some(std::time::Instant::now());
         }
+        let mut denoise_profile_request = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -2418,7 +2737,14 @@ impl eframe::App for App {
             if self.export_in_progress {
                 ui.label(format!("Ekspor: {:.0}%", self.export_progress * 100.0));
             }
-            if self.import_in_progress { ui.label("Membaca media di latar belakang…"); }
+            if self.import_in_progress {
+                ui.horizontal(|ui| {
+                    ui.label("Membaca media di latar belakang…");
+                    if ui.button("Batalkan impor").clicked() {
+                        self.cancel_import();
+                    }
+                });
+            }
             if self.relink_in_progress { ui.label("Menautkan ulang media di latar belakang…"); }
             if self.session_opening { ui.label("Membuka sesi di latar belakang…"); }
             if self.mix_clips && !self.mix_pending {
@@ -2658,6 +2984,17 @@ impl eframe::App for App {
                                 )
                                 .changed();
                         });
+                        let active_restoration_count = usize::from(
+                            !track.settings.rumble_bypass && track.settings.rumble_cutoff_hz > 0.0,
+                        ) + usize::from(!track.settings.hum_bypass)
+                            + usize::from(!track.settings.gate_bypass)
+                            + usize::from(
+                                !track.settings.denoise_bypass
+                                    && track.settings.denoise_reduction_db > 0.0,
+                            );
+                        ui.collapsing(
+                            format!("Restorasi · {active_restoration_count} aktif"),
+                            |ui| {
                         ui.horizontal(|ui| {
                             changed |= ui.add(egui::Slider::new(&mut track.settings.rumble_cutoff_hz, 0.0..=180.0).text("HP Hz")).changed();
                             changed |= ui.checkbox(&mut track.settings.rumble_bypass, "Bypass").changed();
@@ -2705,6 +3042,35 @@ impl eframe::App for App {
                                 .checkbox(&mut track.settings.denoise_bypass, "Bypass denoise")
                                 .changed();
                         });
+                        ui.horizontal(|ui| {
+                            let profile_selection = self
+                                .time_selection
+                                .and_then(|selection| {
+                                    noise_profile_range(&track.settings.clips, selection)
+                                });
+                            if ui
+                                .add_enabled(
+                                    !track.offline && profile_selection.is_some(),
+                                    egui::Button::new("Ambil profil noise dari seleksi"),
+                                )
+                                .on_hover_text(
+                                    "Pilih minimal 0,5 detik bagian yang hanya berisi noise latar pada track ini.",
+                                )
+                                .clicked()
+                            {
+                                denoise_profile_request = Some((index, true));
+                            }
+                            if let Some((start, end)) = track.settings.denoise_profile_range {
+                                ui.weak(format!("Profil tersimpan · {:.2}s", end - start));
+                                if ui.small_button("Hapus profil").clicked() {
+                                    denoise_profile_request = Some((index, false));
+                                }
+                            } else {
+                                ui.weak("Belum ada profil noise");
+                            }
+                        });
+                            },
+                        );
                         egui::ScrollArea::horizontal()
                             .id_salt(("timeline", index))
                             .show(ui, |ui| {
@@ -2948,41 +3314,84 @@ impl eframe::App for App {
                                         egui::FontId::proportional(11.0),
                                         egui::Color32::WHITE,
                                     );
-                                    let source_duration = track.audio.samples.len() as f64
-                                        / track.audio.channels as f64
-                                        / track.audio.sample_rate as f64;
-                                    if source_duration > 0.0
-                                        && !track.peaks.is_empty()
+                                    let visible_clip =
+                                        painter.clip_rect().intersect(clip_rect);
+                                    let clip_duration = clip.source_end - clip.source_start;
+                                    let visible_source_start = clip.source_start
+                                        + ((visible_clip.left() - left)
+                                            / pixels_per_second)
+                                            .clamp(0.0, clip_duration as f32)
+                                            as f64;
+                                    let visible_source_end = clip.source_start
+                                        + ((visible_clip.right() - left)
+                                            / pixels_per_second)
+                                            .clamp(0.0, clip_duration as f32)
+                                            as f64;
+                                    let source_start_frame = (visible_source_start
+                                        * track.audio.sample_rate as f64)
+                                        .floor()
+                                        .max(0.0)
+                                        as usize;
+                                    let source_end_frame = (visible_source_end
+                                        * track.audio.sample_rate as f64)
+                                        .ceil()
+                                        .min((track.audio.samples.len()
+                                            / track.audio.channels.max(1) as usize)
+                                            as f64)
+                                        as usize;
+                                    let frames_per_pixel = track.audio.sample_rate as f32
+                                        / pixels_per_second.max(1.0);
+                                    let peak_level = track
+                                        .waveform
+                                        .levels
+                                        .iter()
+                                        .rev()
+                                        .find(|level| {
+                                            level.window_frames as f32 <= frames_per_pixel
+                                        })
+                                        .or_else(|| track.waveform.levels.first());
+                                    if source_end_frame > source_start_frame
                                         && right > left
+                                        && let Some(level) = peak_level
+                                        && !level.peaks.is_empty()
                                     {
-                                        let first = ((clip.source_start / source_duration)
-                                            * track.peaks.len() as f64)
-                                            as usize;
-                                        let last = (((clip.source_end / source_duration)
-                                            * track.peaks.len() as f64)
-                                            .ceil()
-                                            as usize)
-                                            .min(track.peaks.len());
-                                        if last > first {
-                                            let mid = clip_rect.center().y;
-                                            let dx = clip_rect.width() / (last - first) as f32;
-                                            for (bin, peak) in track.peaks[first.min(last)..last]
-                                                .iter()
-                                                .enumerate()
-                                            {
-                                                let x = clip_rect.left() + bin as f32 * dx;
-                                                let h = peak * clip_rect.height() * 0.34;
-                                                painter.line_segment(
-                                                    [
-                                                        egui::pos2(x, mid - h),
-                                                        egui::pos2(x, mid + h),
-                                                    ],
-                                                    (
-                                                        dx.max(1.0),
-                                                        egui::Color32::from_rgb(137, 215, 198),
-                                                    ),
-                                                );
+                                        let first = source_start_frame / level.window_frames;
+                                        let last = source_end_frame
+                                            .div_ceil(level.window_frames)
+                                            .min(level.peaks.len());
+                                        let clip_source_start =
+                                            clip.source_start * track.audio.sample_rate as f64;
+                                        let mid = clip_rect.center().y;
+                                        for bin in first.min(last)..last {
+                                            let bin_start = (bin * level.window_frames) as f64;
+                                            let visible_start =
+                                                bin_start.max(source_start_frame as f64);
+                                            let visible_end = (bin_start
+                                                + level.window_frames as f64)
+                                                .min(source_end_frame as f64);
+                                            if visible_end <= visible_start {
+                                                continue;
                                             }
+                                            let x = clip_rect.left()
+                                                + ((visible_start - clip_source_start)
+                                                    / track.audio.sample_rate as f64)
+                                                    as f32
+                                                    * pixels_per_second;
+                                            let width = ((visible_end - visible_start)
+                                                / track.audio.sample_rate as f64)
+                                                as f32
+                                                * pixels_per_second;
+                                            let h = level.peaks[bin] * clip_rect.height() * 0.34;
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, mid - h),
+                                                    egui::pos2(x, mid + h),
+                                                ],
+                                                (
+                                                    width.max(1.0),
+                                                    egui::Color32::from_rgb(137, 215, 198),
+                                                ),
+                                            );
                                         }
                                     }
                                     let _ = clip_index;
@@ -3049,6 +3458,24 @@ impl eframe::App for App {
                 }
             }
         });
+        if let Some((track_index, capture)) = denoise_profile_request {
+            if capture {
+                self.capture_denoise_profile(track_index);
+            } else {
+                self.clear_denoise_profile(track_index);
+            }
+        }
+        if self.time_selection.is_none() {
+            self.preview_selection_only = false;
+        }
+        let desired_preview_range = if self.preview_selection_only {
+            self.time_selection
+        } else {
+            None
+        };
+        if desired_preview_range != self.mix_preview_range && self.selection_drag_origin.is_none() {
+            self.rebuild_mix();
+        }
         self.sync_loop_selection();
         self.autosave_if_due();
     }
@@ -3083,6 +3510,7 @@ fn denoise_samples_controlled(
     channels: usize,
     sample_rate: u32,
     reduction_db: f32,
+    profile_range: Option<(f64, f64)>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<f32>, String> {
     if channels == 0 || sample_rate == 0 || samples.is_empty() {
@@ -3091,7 +3519,15 @@ fn denoise_samples_controlled(
     if !reduction_db.is_finite() || !(0.0..=30.0).contains(&reduction_db) {
         return Err("Pengaturan denoise tidak valid".into());
     }
-    let filter = format!("afftdn=nr={reduction_db:.1}:nf=-50:tn=1");
+    let filter = if let Some((start, end)) =
+        profile_range.filter(|(start, end)| start.is_finite() && end.is_finite() && *end > *start)
+    {
+        format!(
+            "asendcmd={start:.9} afftdn sn start,asendcmd={end:.9} afftdn sn stop,afftdn=nr={reduction_db:.1}:nf=-50:tn=0"
+        )
+    } else {
+        format!("afftdn=nr={reduction_db:.1}:nf=-50:tn=1")
+    };
     let mut child = std::process::Command::new("ffmpeg")
         .args([
             "-nostdin",
@@ -3212,12 +3648,197 @@ fn denoise_samples_controlled(
 
 #[cfg(test)]
 fn render_mix(tracks: &[Track]) -> Result<MixRender, String> {
-    render_mix_internal(tracks, None)
+    render_mix_internal(tracks, None, None)
+}
+
+fn process_pre_denoise(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    settings: &TrackSettings,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<f32>, String> {
+    let mut output = samples.to_vec();
+    if !settings.rumble_bypass && settings.rumble_cutoff_hz > 0.0 {
+        output = highpass_samples_controlled(
+            &output,
+            channels,
+            sample_rate,
+            settings.rumble_cutoff_hz,
+            cancelled,
+        )?;
+    }
+    if !settings.hum_bypass {
+        output = hum_removal_samples_controlled(
+            &output,
+            channels,
+            sample_rate,
+            settings.hum_frequency_hz,
+            cancelled,
+        )?;
+    }
+    if !settings.gate_bypass {
+        output = expander_samples_controlled(
+            &output,
+            channels,
+            sample_rate,
+            settings.gate_threshold_db,
+            false,
+            cancelled,
+        )?;
+    }
+    Ok(output)
+}
+
+fn process_effect_region(
+    source: &[f32],
+    core_frames: (usize, usize),
+    channels: usize,
+    sample_rate: u32,
+    settings: &TrackSettings,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(usize, usize, Vec<f32>), String> {
+    let frame_count = source.len() / channels;
+    let padding = (sample_rate as usize / 4).max(1);
+    let expanded_start = core_frames.0.saturating_sub(padding);
+    let expanded_end = core_frames.1.saturating_add(padding).min(frame_count);
+    let expanded = &source[expanded_start * channels..expanded_end * channels];
+    let mut output = process_pre_denoise(expanded, channels, sample_rate, settings, cancelled)?;
+    if !settings.denoise_bypass && settings.denoise_reduction_db > 0.0 {
+        if let Some((profile_start, profile_end)) = settings.denoise_profile_range {
+            let profile_start = (profile_start * sample_rate as f64)
+                .floor()
+                .clamp(0.0, frame_count as f64) as usize;
+            let profile_end = (profile_end * sample_rate as f64)
+                .ceil()
+                .clamp(0.0, frame_count as f64) as usize;
+            if profile_end > profile_start {
+                let profile_expanded_start = profile_start.saturating_sub(padding);
+                let profile_expanded_end = profile_end.saturating_add(padding).min(frame_count);
+                let profile_expanded =
+                    &source[profile_expanded_start * channels..profile_expanded_end * channels];
+                let profile_processed = process_pre_denoise(
+                    profile_expanded,
+                    channels,
+                    sample_rate,
+                    settings,
+                    cancelled,
+                )?;
+                let profile_offset = (profile_start - profile_expanded_start) * channels;
+                let profile_samples = &profile_processed
+                    [profile_offset..profile_offset + (profile_end - profile_start) * channels];
+                let profile_duration = (profile_end - profile_start) as f64 / sample_rate as f64;
+                let mut denoise_input = Vec::with_capacity(profile_samples.len() + output.len());
+                denoise_input.extend_from_slice(profile_samples);
+                denoise_input.extend_from_slice(&output);
+                let denoised = denoise_samples_controlled(
+                    &denoise_input,
+                    channels,
+                    sample_rate,
+                    settings.denoise_reduction_db,
+                    Some((0.0, profile_duration)),
+                    cancelled,
+                )?;
+                output = denoised[profile_samples.len()..].to_vec();
+            } else {
+                output = denoise_samples_controlled(
+                    &output,
+                    channels,
+                    sample_rate,
+                    settings.denoise_reduction_db,
+                    None,
+                    cancelled,
+                )?;
+            }
+        } else {
+            output = denoise_samples_controlled(
+                &output,
+                channels,
+                sample_rate,
+                settings.denoise_reduction_db,
+                None,
+                cancelled,
+            )?;
+        }
+    }
+    Ok((expanded_start, expanded_end, output))
+}
+
+fn process_effects_in_preview(
+    source: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    settings: &TrackSettings,
+    clips: &[ClipSettings],
+    preview_range: (f64, f64),
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<ProcessedRegion>, String> {
+    let frame_count = source.len() / channels;
+    let mut ranges = clips
+        .iter()
+        .filter_map(|clip| {
+            let clip_duration = clip.source_end - clip.source_start;
+            let selection_start = preview_range.0.max(clip.position);
+            let selection_end = preview_range.1.min(clip.position + clip_duration);
+            (selection_end > selection_start).then_some((
+                clip.source_start + selection_start - clip.position,
+                clip.source_start + selection_end - clip.position,
+            ))
+        })
+        .filter_map(|(start, end)| {
+            let start = (start * sample_rate as f64)
+                .floor()
+                .clamp(0.0, frame_count as f64) as usize;
+            let end = (end * sample_rate as f64)
+                .ceil()
+                .clamp(0.0, frame_count as f64) as usize;
+            (end > start).then_some((start, end))
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    let context_gap = (sample_rate as usize / 2).max(1);
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1.saturating_add(context_gap)
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let mut output = Vec::with_capacity(merged.len());
+    for (start, end) in merged {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("Preview dibatalkan".into());
+        }
+        let (expanded_start, _, processed) = process_effect_region(
+            source,
+            (start, end),
+            channels,
+            sample_rate,
+            settings,
+            cancelled,
+        )?;
+        output.push(ProcessedRegion {
+            start_frame: expanded_start,
+            samples: Arc::new(processed),
+        });
+    }
+    Ok(output)
 }
 
 fn prepare_mix_playback(
     tracks: &[Track],
     cancelled: Option<&AtomicBool>,
+) -> Result<MixPlayback, String> {
+    prepare_mix_playback_with_preview(tracks, cancelled, None)
+}
+
+fn prepare_mix_playback_with_preview(
+    tracks: &[Track],
+    cancelled: Option<&AtomicBool>,
+    preview_range: Option<(f64, f64)>,
 ) -> Result<MixPlayback, String> {
     if tracks.is_empty() {
         return Err("Tidak ada track yang dapat dirender".into());
@@ -3249,6 +3870,9 @@ fn prepare_mix_playback(
         .iter()
         .any(|track| track.settings.solo && !track.settings.mute);
     let mut prepared = Vec::new();
+    let preview_range = preview_range.filter(|(start, end)| {
+        start.is_finite() && end.is_finite() && *start >= 0.0 && *end > *start
+    });
     for (source_index, track) in tracks.iter().enumerate() {
         if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Err("Ekspor dibatalkan".into());
@@ -3260,47 +3884,53 @@ fn prepare_mix_playback(
         if channels == 0 || track.audio.sample_rate == 0 || track.audio.samples.len() < channels {
             continue;
         }
-        let mut samples = track.audio.samples.clone();
-        if !track.settings.rumble_bypass && track.settings.rumble_cutoff_hz > 0.0 {
-            samples = Arc::new(highpass_samples_controlled(
-                &samples,
-                channels,
-                track.audio.sample_rate,
-                track.settings.rumble_cutoff_hz,
-                cancelled,
-            )?);
-        }
-        if !track.settings.hum_bypass {
-            samples = Arc::new(hum_removal_samples_controlled(
-                &samples,
-                channels,
-                track.audio.sample_rate,
-                track.settings.hum_frequency_hz,
-                cancelled,
-            )?);
-        }
-        if !track.settings.gate_bypass {
-            samples = Arc::new(expander_samples_controlled(
-                &samples,
-                channels,
-                track.audio.sample_rate,
-                track.settings.gate_threshold_db,
-                false,
-                cancelled,
-            )?);
-        }
-        if !track.settings.denoise_bypass && track.settings.denoise_reduction_db > 0.0 {
-            samples = Arc::new(denoise_samples_controlled(
-                &samples,
-                channels,
-                track.audio.sample_rate,
-                track.settings.denoise_reduction_db,
-                cancelled,
-            )?);
-        }
+        let (samples, processed_regions) = if let Some(preview_range) = preview_range {
+            (
+                track.audio.samples.clone(),
+                process_effects_in_preview(
+                    &track.audio.samples,
+                    channels,
+                    track.audio.sample_rate,
+                    &track.settings,
+                    &track.settings.clips,
+                    preview_range,
+                    cancelled,
+                )?,
+            )
+        } else {
+            let needs_pre_processing = (!track.settings.rumble_bypass
+                && track.settings.rumble_cutoff_hz > 0.0)
+                || !track.settings.hum_bypass
+                || !track.settings.gate_bypass;
+            let mut samples = if needs_pre_processing {
+                Arc::new(SampleBuffer::owned(process_pre_denoise(
+                    &track.audio.samples,
+                    channels,
+                    track.audio.sample_rate,
+                    &track.settings,
+                    cancelled,
+                )?))
+            } else {
+                track.audio.samples.clone()
+            };
+            if !track.settings.denoise_bypass && track.settings.denoise_reduction_db > 0.0 {
+                let denoised = denoise_samples_controlled(
+                    &samples,
+                    channels,
+                    track.audio.sample_rate,
+                    track.settings.denoise_reduction_db,
+                    track.settings.denoise_profile_range,
+                    cancelled,
+                )?;
+                samples = Arc::new(SampleBuffer::owned(denoised));
+            }
+            (samples, Vec::new())
+        };
         prepared.push(PreparedTrack {
             source_index,
             samples,
+            processed_regions,
+            preview_range,
             channels,
             sample_rate: track.audio.sample_rate,
             gain_left: track.settings.gain * (1.0 - track.settings.pan.clamp(-1.0, 1.0).max(0.0)),
@@ -3318,8 +3948,13 @@ fn prepare_mix_playback(
 fn render_mix_internal(
     tracks: &[Track],
     cancelled: Option<&AtomicBool>,
+    preview_range: Option<(f64, f64)>,
 ) -> Result<MixRender, String> {
-    let playback = Arc::new(prepare_mix_playback(tracks, cancelled)?);
+    let playback = Arc::new(prepare_mix_playback_with_preview(
+        tracks,
+        cancelled,
+        preview_range,
+    )?);
     let frames = playback.frames;
     let mut peaks = vec![0.0f32; 1600];
     let mut clips = false;
@@ -3502,67 +4137,251 @@ fn replace_output(temp: &std::path::Path, destination: &std::path::Path) -> Resu
     Ok(())
 }
 
+fn append_wav_samples<I, T>(
+    output: &mut SourceCacheWriter,
+    samples: I,
+    cancelled: Option<&AtomicBool>,
+    convert: impl Fn(T) -> f32,
+) -> Result<(), String>
+where
+    I: Iterator<Item = Result<T, hound::Error>>,
+{
+    for (index, sample) in samples.enumerate() {
+        if index % 16_384 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("Impor dibatalkan".into());
+        }
+        output.append_sample(convert(
+            sample.map_err(|error| format!("Gagal membaca sampel WAV: {error}"))?,
+        ))?;
+    }
+    Ok(())
+}
+
+fn source_sample_cache_path(
+    source_path: &std::path::Path,
+    sample_rate: u32,
+    channels: usize,
+) -> Option<std::path::PathBuf> {
+    let metadata = std::fs::metadata(source_path).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let canonical_path = source_path
+        .canonicalize()
+        .unwrap_or_else(|_| source_path.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    0x534f_5552_4345_0001u64.hash(&mut hasher);
+    canonical_path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified_nanos.hash(&mut hasher);
+    sample_rate.hash(&mut hasher);
+    channels.hash(&mut hasher);
+    Some(
+        std::env::temp_dir()
+            .join("izotay-source-cache")
+            .join(format!("{:016x}.f32", hasher.finish())),
+    )
+}
+
+fn load_cached_samples(
+    source_path: &std::path::Path,
+    sample_rate: u32,
+    channels: usize,
+) -> Option<Arc<SampleBuffer>> {
+    let path = source_sample_cache_path(source_path, sample_rate, channels)?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    if metadata.len() == 0 || metadata.len() % 4 != 0 {
+        return None;
+    }
+    let samples = SampleBuffer::mapped(&path, channels).ok()?;
+    Some(Arc::new(samples))
+}
+
+struct SourceCacheWriter {
+    path: std::path::PathBuf,
+    temp: std::path::PathBuf,
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+    channels: usize,
+    sample_count: usize,
+    pending: Vec<u8>,
+}
+impl SourceCacheWriter {
+    fn new(
+        source_path: &std::path::Path,
+        sample_rate: u32,
+        channels: usize,
+    ) -> Result<Self, String> {
+        let path = source_sample_cache_path(source_path, sample_rate, channels)
+            .ok_or_else(|| "Cache sampel tidak dapat dibuat untuk media ini".to_owned())?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Direktori cache sampel tidak valid".to_owned())?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Tidak dapat membuat direktori cache sampel: {error}"))?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+        let file = std::fs::File::create(&temp)
+            .map_err(|error| format!("Tidak dapat membuat cache sampel: {error}"))?;
+        Ok(Self {
+            path,
+            temp,
+            writer: Some(std::io::BufWriter::new(file)),
+            channels,
+            sample_count: 0,
+            pending: Vec::with_capacity(65_536),
+        })
+    }
+
+    fn append_sample(&mut self, sample: f32) -> Result<(), String> {
+        use std::io::Write;
+        self.pending.extend_from_slice(&sample.to_le_bytes());
+        self.sample_count += 1;
+        if self.pending.len() >= self.pending.capacity() {
+            self.writer
+                .as_mut()
+                .ok_or_else(|| "Penulis cache sampel sudah ditutup".to_owned())?
+                .write_all(&self.pending)
+                .map_err(|error| format!("Gagal menulis cache sampel: {error}"))?;
+            self.pending.clear();
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Arc<SampleBuffer>, String> {
+        use std::io::Write;
+        if self.sample_count == 0 || !self.sample_count.is_multiple_of(self.channels.max(1)) {
+            return Err("Media tidak memiliki sampel audio yang dapat dibaca".into());
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| "Penulis cache sampel sudah ditutup".to_owned())?;
+        writer
+            .write_all(&self.pending)
+            .map_err(|error| format!("Gagal menulis cache sampel: {error}"))?;
+        self.pending.clear();
+        writer
+            .flush()
+            .map_err(|error| format!("Gagal menyimpan cache sampel: {error}"))?;
+        drop(self.writer.take());
+        if let Err(error) = std::fs::rename(&self.temp, &self.path) {
+            if let Ok(cached) = SampleBuffer::mapped(&self.path, self.channels) {
+                let _ = std::fs::remove_file(&self.temp);
+                return Ok(Arc::new(cached));
+            }
+            return Err(format!("Gagal menyimpan cache sampel: {error}"));
+        }
+        let samples = SampleBuffer::mapped(&self.path, self.channels)?;
+        Ok(Arc::new(samples))
+    }
+}
+impl Drop for SourceCacheWriter {
+    fn drop(&mut self) {
+        if self.temp.exists() {
+            let _ = std::fs::remove_file(&self.temp);
+        }
+    }
+}
+
+#[cfg(test)]
 fn read_wav(path: &std::path::Path) -> Result<Audio, String> {
+    read_wav_controlled(path, None)
+}
+
+fn read_wav_controlled(
+    path: &std::path::Path,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Audio, String> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err("Impor dibatalkan".into());
+    }
     let mut reader =
         hound::WavReader::open(path).map_err(|e| format!("Tidak dapat membuka WAV: {e}"))?;
     let spec = reader.spec();
-    let samples: Result<Vec<f32>, _> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .map(|s| {
-                s.map(|v| {
-                    if v.is_finite() {
-                        v.clamp(-1.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                })
-            })
-            .collect(),
+    if let Some(samples) = load_cached_samples(path, spec.sample_rate, spec.channels as usize) {
+        return Ok(Audio {
+            samples,
+            sample_rate: spec.sample_rate,
+            channels: spec.channels,
+        });
+    }
+    if spec.channels == 0 || spec.sample_rate == 0 {
+        return Err("WAV memiliki format audio yang tidak valid".into());
+    }
+    let mut samples = SourceCacheWriter::new(path, spec.sample_rate, spec.channels as usize)?;
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            append_wav_samples(&mut samples, reader.samples::<f32>(), cancelled, |value| {
+                if value.is_finite() {
+                    value.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                }
+            })?
+        }
         hound::SampleFormat::Int if spec.bits_per_sample <= 16 => {
             let scale = 2.0f32.powi(spec.bits_per_sample as i32 - 1);
-            reader
-                .samples::<i16>()
-                .map(|s| s.map(|v| (v as f32 / scale).clamp(-1.0, 1.0)))
-                .collect()
+            append_wav_samples(&mut samples, reader.samples::<i16>(), cancelled, |value| {
+                (value as f32 / scale).clamp(-1.0, 1.0)
+            })?;
         }
         hound::SampleFormat::Int => {
             let scale = 2.0f32.powi(spec.bits_per_sample as i32 - 1);
-            reader
-                .samples::<i32>()
-                .map(|s| s.map(|v| (v as f32 / scale).clamp(-1.0, 1.0)))
-                .collect()
+            append_wav_samples(&mut samples, reader.samples::<i32>(), cancelled, |value| {
+                (value as f32 / scale).clamp(-1.0, 1.0)
+            })?;
         }
-    };
-    let samples = samples.map_err(|e| format!("Gagal membaca sampel WAV: {e}"))?;
-    if spec.channels == 0
-        || spec.sample_rate == 0
-        || samples.is_empty()
-        || samples.len() % spec.channels as usize != 0
-    {
-        return Err("WAV tidak memiliki sampel audio yang dapat dibaca".into());
     }
     Ok(Audio {
-        samples: Arc::new(samples),
+        samples: samples.finish()?,
         sample_rate: spec.sample_rate,
         channels: spec.channels,
     })
 }
 fn read_media_audio(path: &std::path::Path) -> Result<Audio, String> {
+    read_media_audio_controlled(path, None)
+}
+
+fn read_media_audio_controlled(
+    path: &std::path::Path,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Audio, String> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err("Impor dibatalkan".into());
+    }
     if path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
     {
-        return read_wav(path);
+        return read_wav_controlled(path, cancelled);
     }
-    let output = std::process::Command::new("ffmpeg")
+    if let Some(samples) = load_cached_samples(path, 48_000, 2) {
+        return Ok(Audio {
+            samples,
+            sample_rate: 48_000,
+            channels: 2,
+        });
+    }
+    let mut sample_cache = SourceCacheWriter::new(path, 48_000, 2)?;
+    let mut child = std::process::Command::new("ffmpeg")
         .args(["-nostdin", "-v", "error", "-i"])
         .arg(path)
         .args([
             "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000", "-f", "f32le", "pipe:1",
         ])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 "FFmpeg diperlukan untuk membaca audio dari video dan format non-WAV".to_owned()
@@ -3570,33 +4389,110 @@ fn read_media_audio(path: &std::path::Path) -> Result<Audio, String> {
                 format!("Gagal menjalankan FFmpeg: {error}")
             }
         })?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Output audio FFmpeg tidak tersedia".to_owned())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Log FFmpeg tidak tersedia".to_owned())?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stderr, &mut bytes).map(|_| bytes)
+    });
+    let mut buffer = [0u8; 65_536];
+    let mut carry = [0u8; 4];
+    let mut carry_len = 0usize;
+    loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err("Impor dibatalkan".into());
+        }
+        let read = match std::io::Read::read(&mut stdout, &mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(format!("Gagal membaca audio dari FFmpeg: {error}"));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        let mut offset = 0usize;
+        if carry_len > 0 {
+            let needed = 4 - carry_len;
+            let take = needed.min(read);
+            carry[carry_len..carry_len + take].copy_from_slice(&buffer[..take]);
+            carry_len += take;
+            offset += take;
+            if carry_len < 4 {
+                continue;
+            }
+            let value = f32::from_le_bytes(carry);
+            let sample = if value.is_finite() {
+                value.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            if let Err(error) = sample_cache.append_sample(sample) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(error);
+            }
+        }
+        let aligned_end = offset + ((read - offset) / 4) * 4;
+        for bytes in buffer[offset..aligned_end].as_chunks::<4>().0 {
+            let value = f32::from_le_bytes(*bytes);
+            let sample = if value.is_finite() {
+                value.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            if let Err(error) = sample_cache.append_sample(sample) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(error);
+            }
+        }
+        carry_len = read - aligned_end;
+        if carry_len > 0 {
+            carry[..carry_len].copy_from_slice(&buffer[aligned_end..read]);
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("Gagal menunggu FFmpeg: {error}"))?;
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        let _ = stderr_reader.join();
+        return Err("Impor dibatalkan".into());
+    }
+    let error_output = stderr_reader
+        .join()
+        .map_err(|_| "Pembaca log FFmpeg berhenti tiba-tiba".to_owned())?
+        .map_err(|error| format!("Gagal membaca log FFmpeg: {error}"))?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&error_output);
         return Err(format!(
             "FFmpeg tidak dapat membaca audio dari {}: {}",
             path.display(),
             detail.trim()
         ));
     }
-    if output.stdout.is_empty() || output.stdout.len() % 8 != 0 {
+    if sample_cache.sample_count == 0
+        || carry_len != 0
+        || !sample_cache.sample_count.is_multiple_of(2)
+    {
         return Err("Media tidak memiliki audio yang dapat dibaca".into());
     }
-    let samples = output
-        .stdout
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|sample| {
-            let value = f32::from_le_bytes(*sample);
-            if value.is_finite() {
-                value.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            }
-        })
-        .collect();
     Ok(Audio {
-        samples: Arc::new(samples),
+        samples: sample_cache.finish()?,
         sample_rate: 48_000,
         channels: 2,
     })
@@ -3610,17 +4506,315 @@ fn is_video_file(path: &std::path::Path) -> bool {
                 .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         })
 }
+#[cfg(test)]
 fn peak_data(samples: &[f32], channels: usize, bins: usize) -> Vec<f32> {
+    peak_data_controlled(samples, channels, bins, None)
+        .expect("penghitungan waveform tanpa pembatalan tidak gagal")
+}
+
+#[cfg(test)]
+fn peak_data_controlled(
+    samples: &[f32],
+    channels: usize,
+    bins: usize,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<f32>, String> {
     let frames = samples.len() / channels.max(1);
-    (0..bins)
-        .map(|i| {
-            let start = i * frames / bins;
-            let end = ((i + 1) * frames / bins).max(start + 1).min(frames);
+    let mut peaks = Vec::with_capacity(bins);
+    for i in 0..bins {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("Impor dibatalkan".into());
+        }
+        let start = i * frames / bins.max(1);
+        let end = ((i + 1) * frames / bins.max(1)).max(start + 1).min(frames);
+        peaks.push(
             samples[start * channels..end * channels]
                 .iter()
-                .fold(0.0f32, |m, x| m.max(x.abs()))
-        })
-        .collect()
+                .fold(0.0f32, |max, sample| max.max(sample.abs())),
+        );
+    }
+    Ok(peaks)
+}
+
+const WAVEFORM_BASE_WINDOW_FRAMES: usize = 256;
+
+fn build_peak_pyramid_controlled(
+    samples: &[f32],
+    channels: usize,
+    cancelled: Option<&AtomicBool>,
+) -> Result<WaveformCache, String> {
+    if channels == 0 {
+        return Ok(WaveformCache::default());
+    }
+    let frames = samples.len() / channels;
+    if frames == 0 {
+        return Ok(WaveformCache::default());
+    }
+    let mut base = Vec::with_capacity(frames.div_ceil(WAVEFORM_BASE_WINDOW_FRAMES));
+    for (bin, start_frame) in (0..frames).step_by(WAVEFORM_BASE_WINDOW_FRAMES).enumerate() {
+        if bin % 128 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("Impor dibatalkan".into());
+        }
+        let end_frame = start_frame
+            .saturating_add(WAVEFORM_BASE_WINDOW_FRAMES)
+            .min(frames);
+        let peak = samples[start_frame * channels..end_frame * channels]
+            .iter()
+            .fold(0.0f32, |max, sample| max.max(sample.abs()));
+        base.push(peak);
+    }
+    let mut levels = vec![PeakLevel {
+        window_frames: WAVEFORM_BASE_WINDOW_FRAMES,
+        peaks: base,
+    }];
+    loop {
+        let (window_frames, next) = {
+            let previous = levels.last().unwrap();
+            if previous.peaks.len() <= 1 {
+                break;
+            }
+            let window_frames = previous.window_frames.saturating_mul(2);
+            let mut next = Vec::with_capacity(previous.peaks.len().div_ceil(2));
+            for (index, pair) in previous.peaks.chunks(2).enumerate() {
+                if index % 16_384 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    return Err("Impor dibatalkan".into());
+                }
+                next.push(pair.iter().copied().fold(0.0f32, f32::max));
+            }
+            (window_frames, next)
+        };
+        levels.push(PeakLevel {
+            window_frames,
+            peaks: next,
+        });
+    }
+    Ok(WaveformCache { levels })
+}
+
+fn waveform_cache_path(
+    source_path: &std::path::Path,
+    sample_rate: u32,
+    channels: usize,
+) -> Option<(std::path::PathBuf, u64)> {
+    let metadata = std::fs::metadata(source_path).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let canonical_path = source_path
+        .canonicalize()
+        .unwrap_or_else(|_| source_path.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical_path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified_nanos.hash(&mut hasher);
+    sample_rate.hash(&mut hasher);
+    channels.hash(&mut hasher);
+    let key = hasher.finish();
+    let cache_path = std::env::temp_dir()
+        .join("izotay-waveform-cache")
+        .join(format!("{key:016x}.bin"));
+    Some((cache_path, key))
+}
+
+fn cached_peak_pyramid_controlled(
+    source_path: &std::path::Path,
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Arc<WaveformCache>, String> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err("Impor dibatalkan".into());
+    }
+    let frames = samples.len() / channels.max(1);
+    let cache = if frames > 0 {
+        if let Some((path, key)) = waveform_cache_path(source_path, sample_rate, channels) {
+            load_waveform_cache(&path, key, frames, cancelled)?.map(|cache| (path, key, cache))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some((_, _, cache)) = cache {
+        return Ok(cache);
+    }
+    let built = build_peak_pyramid_controlled(samples, channels, cancelled)?;
+    if frames == 0 {
+        return Ok(Arc::new(built));
+    }
+    if let Some((path, key)) = waveform_cache_path(source_path, sample_rate, channels) {
+        let _ = save_waveform_cache(&path, key, frames, &built);
+    }
+    Ok(Arc::new(built))
+}
+
+fn waveform_cache_file_len(frames: usize) -> Option<u64> {
+    if frames == 0 {
+        return None;
+    }
+    let mut size = 8u64 + 8 + 8 + 4;
+    let mut window = WAVEFORM_BASE_WINDOW_FRAMES;
+    loop {
+        let bins = frames.div_ceil(window);
+        size = size.checked_add(16)?;
+        size = size.checked_add(u64::try_from(bins).ok()?.checked_mul(4)?)?;
+        if bins <= 1 {
+            return Some(size);
+        }
+        window = window.checked_mul(2)?;
+    }
+}
+
+fn load_waveform_cache(
+    path: &std::path::Path,
+    key: u64,
+    frames: usize,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Option<Arc<WaveformCache>>, String> {
+    let expected_length = waveform_cache_file_len(frames).unwrap_or(u64::MAX);
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(None);
+    };
+    if metadata.len() != expected_length {
+        return Ok(None);
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let parsed = (|| -> Option<WaveformCache> {
+        let mut magic = [0u8; 8];
+        std::io::Read::read_exact(&mut reader, &mut magic).ok()?;
+        if &magic != b"IZWAV001" {
+            return None;
+        }
+        let read_u64 = |reader: &mut std::io::BufReader<std::fs::File>| -> Option<u64> {
+            let mut bytes = [0u8; 8];
+            std::io::Read::read_exact(reader, &mut bytes).ok()?;
+            Some(u64::from_le_bytes(bytes))
+        };
+        if read_u64(&mut reader)? != key || read_u64(&mut reader)? != frames as u64 {
+            return None;
+        }
+        let mut level_count_bytes = [0u8; 4];
+        std::io::Read::read_exact(&mut reader, &mut level_count_bytes).ok()?;
+        let level_count = u32::from_le_bytes(level_count_bytes) as usize;
+        let mut expected_window = WAVEFORM_BASE_WINDOW_FRAMES;
+        let mut expected_levels = 1usize;
+        while frames.div_ceil(expected_window) > 1 {
+            expected_window = expected_window.checked_mul(2)?;
+            expected_levels += 1;
+        }
+        if level_count != expected_levels || level_count > 64 {
+            return None;
+        }
+        let mut levels = Vec::with_capacity(level_count);
+        expected_window = WAVEFORM_BASE_WINDOW_FRAMES;
+        for _ in 0..level_count {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return None;
+            }
+            let stored_window = read_u64(&mut reader)?;
+            let peak_count = read_u64(&mut reader)?;
+            let expected_count = frames.div_ceil(expected_window);
+            if stored_window != expected_window as u64 || peak_count != expected_count as u64 {
+                return None;
+            }
+            let mut peaks = Vec::with_capacity(expected_count);
+            let mut bytes = [0u8; 65_536];
+            let mut remaining = expected_count;
+            while remaining > 0 {
+                if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return None;
+                }
+                let count = remaining.min(bytes.len() / 4);
+                let chunk = &mut bytes[..count * 4];
+                std::io::Read::read_exact(&mut reader, chunk).ok()?;
+                for sample_bytes in chunk.as_chunks::<4>().0 {
+                    let peak = f32::from_le_bytes(*sample_bytes);
+                    if !peak.is_finite() || !(0.0..=1.0).contains(&peak) {
+                        return None;
+                    }
+                    peaks.push(peak);
+                }
+                remaining -= count;
+            }
+            levels.push(PeakLevel {
+                window_frames: expected_window,
+                peaks,
+            });
+            if expected_count > 1 {
+                expected_window = expected_window.checked_mul(2)?;
+            }
+        }
+        let mut trailing = [0u8; 1];
+        if std::io::Read::read(&mut reader, &mut trailing).ok()? != 0 {
+            return None;
+        }
+        Some(WaveformCache { levels })
+    })();
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err("Impor dibatalkan".into());
+    }
+    Ok(parsed.map(Arc::new))
+}
+
+fn save_waveform_cache(
+    path: &std::path::Path,
+    key: u64,
+    frames: usize,
+    cache: &WaveformCache,
+) -> Result<(), String> {
+    if std::fs::metadata(path).is_ok() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Direktori cache waveform tidak valid".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+    let result = (|| -> Result<(), String> {
+        let file = std::fs::File::create(&temp).map_err(|error| error.to_string())?;
+        let mut writer = std::io::BufWriter::new(file);
+        std::io::Write::write_all(&mut writer, b"IZWAV001").map_err(|error| error.to_string())?;
+        std::io::Write::write_all(&mut writer, &key.to_le_bytes())
+            .map_err(|error| error.to_string())?;
+        std::io::Write::write_all(&mut writer, &(frames as u64).to_le_bytes())
+            .map_err(|error| error.to_string())?;
+        let level_count = u32::try_from(cache.levels.len())
+            .map_err(|_| "Terlalu banyak level cache waveform".to_owned())?;
+        std::io::Write::write_all(&mut writer, &level_count.to_le_bytes())
+            .map_err(|error| error.to_string())?;
+        for level in &cache.levels {
+            std::io::Write::write_all(&mut writer, &(level.window_frames as u64).to_le_bytes())
+                .map_err(|error| error.to_string())?;
+            std::io::Write::write_all(&mut writer, &(level.peaks.len() as u64).to_le_bytes())
+                .map_err(|error| error.to_string())?;
+            for block in level.peaks.chunks(16_384) {
+                let mut bytes = Vec::with_capacity(block.len() * 4);
+                for peak in block {
+                    bytes.extend_from_slice(&peak.to_le_bytes());
+                }
+                std::io::Write::write_all(&mut writer, &bytes)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        std::io::Write::flush(&mut writer).map_err(|error| error.to_string())?;
+        std::fs::rename(&temp, path).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -3769,8 +4963,9 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{
         Audio, AudioControls, ClipSettings, MixPlayback, MixRequest, MixWorker, PreparedTrack,
-        SessionFile, Track, TrackSettings, expander_samples, highpass_samples, make_render_state,
-        peak_data, read_wav, render, render_mix, write_mix_wav_24,
+        SampleBuffer, SessionFile, Track, TrackSettings, WaveformCache, expander_samples,
+        highpass_samples, make_render_state, peak_data, read_wav, render, render_mix,
+        write_mix_wav_24,
     };
     use std::sync::{Arc, atomic::Ordering};
 
@@ -3829,7 +5024,9 @@ mod tests {
         let playback = MixPlayback {
             tracks: vec![PreparedTrack {
                 source_index: 0,
-                samples: Arc::new(vec![0.5, -0.5, 0.25, -0.25]),
+                samples: Arc::new(SampleBuffer::owned(vec![0.5, -0.5, 0.25, -0.25])),
+                processed_regions: Vec::new(),
+                preview_range: None,
                 channels: 2,
                 sample_rate: 2,
                 gain_left: 1.0,
@@ -3861,7 +5058,9 @@ mod tests {
         let playback = Arc::new(MixPlayback {
             tracks: vec![PreparedTrack {
                 source_index: 0,
-                samples: Arc::new(vec![0.0, 1.0]),
+                samples: Arc::new(SampleBuffer::owned(vec![0.0, 1.0])),
+                processed_regions: Vec::new(),
+                preview_range: None,
                 channels: 1,
                 sample_rate: 2,
                 gain_left: 1.0,
@@ -3904,6 +5103,7 @@ mod tests {
                 gate_bypass: true,
                 denoise_reduction_db: 12.0,
                 denoise_bypass: true,
+                denoise_profile_range: None,
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,
@@ -3914,11 +5114,11 @@ mod tests {
                 }],
             },
             audio: Audio {
-                samples: Arc::new(vec![1.5, 0.5, -0.5, 0.0]),
+                samples: Arc::new(SampleBuffer::owned(vec![1.5, 0.5, -0.5, 0.0])),
                 sample_rate: 4,
                 channels: 1,
             },
-            peaks: Vec::new(),
+            waveform: Arc::new(WaveformCache::default()),
             offline: false,
         };
         let mix = render_mix(&[track]).unwrap();
@@ -3936,6 +5136,7 @@ mod tests {
         worker.submit(MixRequest {
             generation: 9,
             tracks: Vec::new(),
+            preview_range: None,
         });
         let response = worker
             .responses
