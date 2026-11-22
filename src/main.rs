@@ -94,7 +94,16 @@ struct PreparedTrack {
     gain_left: f32,
     gain_right: f32,
     automation: Vec<GainPoint>,
+    bleed_cancellation: Option<BleedCancellation>,
     clips: Vec<ClipSettings>,
+}
+struct BleedCancellation {
+    reference_samples: Arc<SampleBuffer>,
+    reference_channels: usize,
+    reference_sample_rate: u32,
+    alignment_offset_seconds: f64,
+    window_frames: usize,
+    weights: Vec<f32>,
 }
 struct ProcessedRegion {
     start_frame: usize,
@@ -102,21 +111,57 @@ struct ProcessedRegion {
 }
 impl PreparedTrack {
     fn sample(&self, frame: usize, channel: usize, time: f64) -> f32 {
-        if self
+        let source_sample = self.samples[frame * self.channels + channel.min(self.channels - 1)];
+        let mut value = if self
             .preview_range
             .is_some_and(|(start, end)| time >= start && time < end)
             && let Some(region) = self.processed_regions.iter().find(|region| {
                 frame >= region.start_frame
                     && frame < region.start_frame + region.samples.len() / self.channels
-            })
-        {
+            }) {
             let index =
                 (frame - region.start_frame) * self.channels + channel.min(self.channels - 1);
-            if let Some(sample) = region.samples.get(index) {
-                return *sample;
+            region.samples.get(index).copied().unwrap_or(source_sample)
+        } else {
+            source_sample
+        };
+        if let Some(bleed) = &self.bleed_cancellation {
+            let target_time = frame as f64 / self.sample_rate as f64;
+            let reference_time = target_time + bleed.alignment_offset_seconds;
+            if reference_time >= 0.0 && bleed.reference_sample_rate > 0 {
+                let position = reference_time * bleed.reference_sample_rate as f64;
+                let reference_frames =
+                    bleed.reference_samples.len() / bleed.reference_channels.max(1);
+                if reference_frames > 0 && position < reference_frames as f64 {
+                    let low = position.floor() as usize;
+                    let high = (low + 1).min(reference_frames - 1);
+                    let fraction = (position - low as f64) as f32;
+                    let reference_value = |reference_frame: usize| {
+                        if self.channels == 1 && bleed.reference_channels > 1 {
+                            (0..bleed.reference_channels)
+                                .map(|reference_channel| {
+                                    bleed.reference_samples[reference_frame
+                                        * bleed.reference_channels
+                                        + reference_channel]
+                                })
+                                .sum::<f32>()
+                                / bleed.reference_channels as f32
+                        } else {
+                            let reference_channel = channel.min(bleed.reference_channels - 1);
+                            bleed.reference_samples
+                                [reference_frame * bleed.reference_channels + reference_channel]
+                        }
+                    };
+                    let a = reference_value(low);
+                    let b = reference_value(high);
+                    let reference = a + (b - a) * fraction;
+                    let window = frame / bleed.window_frames.max(1);
+                    let weight = bleed.weights.get(window).copied().unwrap_or(0.0);
+                    value -= reference * weight;
+                }
             }
         }
-        self.samples[frame * self.channels + channel.min(self.channels - 1)]
+        value
     }
 }
 struct MixPlayback {
@@ -475,8 +520,17 @@ struct ClipSettings {
 fn default_clip_gain() -> f32 {
     1.0
 }
+static NEXT_TRACK_ID: AtomicU64 = AtomicU64::new(1);
+fn new_track_id() -> u64 {
+    NEXT_TRACK_ID.fetch_add(1, Ordering::Relaxed)
+}
+fn default_bleed_reduction() -> f32 {
+    12.0
+}
 #[derive(Clone, Serialize, Deserialize)]
 struct TrackSettings {
+    #[serde(default = "new_track_id")]
+    track_id: u64,
     name: String,
     path: String,
     gain: f32,
@@ -518,6 +572,14 @@ struct TrackSettings {
     #[serde(default)]
     gain_automation: Vec<GainPoint>,
     #[serde(default)]
+    bleed_enabled: bool,
+    #[serde(default)]
+    bleed_reference_track_id: Option<u64>,
+    #[serde(default = "default_bleed_reduction")]
+    bleed_reduction_db: f32,
+    #[serde(default)]
+    bleed_alignment_offset_ms: f32,
+    #[serde(default)]
     clips: Vec<ClipSettings>,
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -548,6 +610,14 @@ struct EffectSettings {
     dereverb_enabled: bool,
     #[serde(default = "default_dereverb_amount")]
     dereverb_amount: f32,
+    #[serde(default)]
+    bleed_enabled: bool,
+    #[serde(default)]
+    bleed_reference_track_id: Option<u64>,
+    #[serde(default = "default_bleed_reduction")]
+    bleed_reduction_db: f32,
+    #[serde(default)]
+    bleed_alignment_offset_ms: f32,
 }
 impl TrackSettings {
     fn effect_settings(&self) -> EffectSettings {
@@ -568,6 +638,10 @@ impl TrackSettings {
             deesser_reduction_db: self.deesser_reduction_db,
             dereverb_enabled: self.dereverb_enabled,
             dereverb_amount: self.dereverb_amount,
+            bleed_enabled: self.bleed_enabled,
+            bleed_reference_track_id: self.bleed_reference_track_id,
+            bleed_reduction_db: self.bleed_reduction_db,
+            bleed_alignment_offset_ms: self.bleed_alignment_offset_ms,
         }
     }
     fn apply_effect_settings(&mut self, effects: &EffectSettings) {
@@ -587,6 +661,10 @@ impl TrackSettings {
         self.deesser_reduction_db = effects.deesser_reduction_db;
         self.dereverb_enabled = effects.dereverb_enabled;
         self.dereverb_amount = effects.dereverb_amount;
+        self.bleed_enabled = effects.bleed_enabled;
+        self.bleed_reference_track_id = effects.bleed_reference_track_id;
+        self.bleed_reduction_db = effects.bleed_reduction_db;
+        self.bleed_alignment_offset_ms = effects.bleed_alignment_offset_ms;
     }
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -613,6 +691,159 @@ fn gain_at_time(points: &[GainPoint], time: f64) -> f32 {
     }
     let amount = ((time - left.time) / span).clamp(0.0, 1.0) as f32;
     left.gain + (right.gain - left.gain) * amount
+}
+
+fn mono_sample_at(samples: &[f32], channels: usize, position: f64) -> Option<f32> {
+    if channels == 0 || !position.is_finite() || position < 0.0 {
+        return None;
+    }
+    let frames = samples.len() / channels;
+    if frames == 0 || position >= frames as f64 {
+        return None;
+    }
+    let low = position.floor() as usize;
+    let high = (low + 1).min(frames - 1);
+    let fraction = (position - low as f64) as f32;
+    let mono = |frame: usize| {
+        (0..channels)
+            .map(|channel| samples[frame * channels + channel])
+            .sum::<f32>()
+            / channels as f32
+    };
+    Some(mono(low) + (mono(high) - mono(low)) * fraction)
+}
+
+fn estimate_alignment_offset(target: &Audio, reference: &Audio) -> Option<f64> {
+    if target.sample_rate == 0
+        || reference.sample_rate == 0
+        || target.channels == 0
+        || reference.channels == 0
+    {
+        return None;
+    }
+    let target_rate = target.sample_rate as usize;
+    let step = target_rate.div_ceil(400).max(1);
+    let target_frames = target.samples.len() / target.channels as usize;
+    let reference_frames = reference.samples.len() / reference.channels as usize;
+    let sample_count = (target_frames / step).min(8 * 400);
+    if sample_count < 128 || reference_frames < 128 {
+        return None;
+    }
+    let max_shift = (target_rate / step / 2).min(sample_count / 3) as isize;
+    let mut best: Option<(f64, isize)> = None;
+    for shift in -max_shift..=max_shift {
+        let mut n = 0.0f64;
+        let (mut sum_target, mut sum_reference, mut sum_target2, mut sum_reference2, mut sum_cross) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for index in 0..sample_count {
+            let reference_index = index as isize + shift;
+            if reference_index < 0 {
+                continue;
+            }
+            let target_position = (index * step) as f64;
+            let reference_position =
+                reference_index as f64 * step as f64 * reference.sample_rate as f64
+                    / target.sample_rate as f64;
+            let Some(a) =
+                mono_sample_at(&target.samples, target.channels as usize, target_position)
+            else {
+                continue;
+            };
+            let Some(b) = mono_sample_at(
+                &reference.samples,
+                reference.channels as usize,
+                reference_position,
+            ) else {
+                continue;
+            };
+            let (a, b) = (a as f64, b as f64);
+            n += 1.0;
+            sum_target += a;
+            sum_reference += b;
+            sum_target2 += a * a;
+            sum_reference2 += b * b;
+            sum_cross += a * b;
+        }
+        if n < 128.0 {
+            continue;
+        }
+        let covariance = sum_cross - sum_target * sum_reference / n;
+        let target_variance = (sum_target2 - sum_target * sum_target / n).max(0.0);
+        let reference_variance = (sum_reference2 - sum_reference * sum_reference / n).max(0.0);
+        let denominator = (target_variance * reference_variance).sqrt();
+        if denominator <= 1e-12 {
+            continue;
+        }
+        let correlation = (covariance / denominator).abs();
+        if best.is_none_or(|(score, _)| correlation > score) {
+            best = Some((correlation, shift));
+        }
+    }
+    best.filter(|(score, _)| *score >= 0.05)
+        .map(|(_, shift)| shift as f64 * step as f64 / target.sample_rate as f64)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_bleed_weights(
+    target: &[f32],
+    target_channels: usize,
+    target_rate: u32,
+    reference: &[f32],
+    reference_channels: usize,
+    reference_rate: u32,
+    alignment_offset_seconds: f64,
+    reduction_db: f32,
+) -> (usize, Vec<f32>) {
+    let window_frames = (target_rate as usize / 10).max(1);
+    let target_frames = target.len() / target_channels.max(1);
+    let reduction = 1.0 - 10.0f32.powf(-reduction_db.clamp(0.0, 24.0) / 20.0);
+    let step = (target_rate as usize).div_ceil(400).max(1);
+    let mut weights = Vec::with_capacity(target_frames.div_ceil(window_frames));
+    for start in (0..target_frames).step_by(window_frames) {
+        let end = (start + window_frames).min(target_frames);
+        let (mut n, mut st, mut sr, mut st2, mut sr2, mut cross) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for frame in (start..end).step_by(step) {
+            let target_value =
+                mono_sample_at(target, target_channels, frame as f64).unwrap_or(0.0) as f64;
+            let ref_time = frame as f64 / target_rate as f64 + alignment_offset_seconds;
+            if ref_time < 0.0 {
+                continue;
+            }
+            let reference_value = mono_sample_at(
+                reference,
+                reference_channels,
+                ref_time * reference_rate as f64,
+            )
+            .unwrap_or(0.0) as f64;
+            n += 1.0;
+            st += target_value;
+            sr += reference_value;
+            st2 += target_value * target_value;
+            sr2 += reference_value * reference_value;
+            cross += target_value * reference_value;
+        }
+        if n < 8.0 {
+            weights.push(0.0);
+            continue;
+        }
+        let covariance = cross - st * sr / n;
+        let target_variance = (st2 - st * st / n).max(0.0);
+        let reference_variance = (sr2 - sr * sr / n).max(0.0);
+        let denominator = (target_variance * reference_variance).sqrt();
+        let correlation = if denominator > 1e-12 {
+            covariance.abs() / denominator
+        } else {
+            0.0
+        };
+        let coefficient = if correlation >= 0.2 && reference_variance > 1e-12 {
+            (covariance / reference_variance).clamp(-1.5, 1.5) as f32
+        } else {
+            0.0
+        };
+        weights.push((coefficient * reduction).clamp(-0.95, 0.95));
+    }
+    (window_frames, weights)
 }
 #[derive(Serialize, Deserialize)]
 struct SessionFile {
@@ -1218,7 +1449,14 @@ impl App {
             && index < self.tracks.len()
         {
             self.checkpoint();
+            let removed_track_id = self.tracks[index].settings.track_id;
             self.tracks.remove(index);
+            for track in &mut self.tracks {
+                if track.settings.bleed_reference_track_id == Some(removed_track_id) {
+                    track.settings.bleed_reference_track_id = None;
+                    track.settings.bleed_enabled = false;
+                }
+            }
             self.rebuild_mix();
         }
     }
@@ -1662,6 +1900,7 @@ impl App {
                                 ));
                                 result.tracks.push(Track {
                                     settings: TrackSettings {
+                                        track_id: new_track_id(),
                                         name,
                                         path: path.display().to_string(),
                                         gain: 1.0,
@@ -1685,6 +1924,10 @@ impl App {
                                         dereverb_enabled: false,
                                         dereverb_amount: default_dereverb_amount(),
                                         gain_automation: Vec::new(),
+                                        bleed_enabled: false,
+                                        bleed_reference_track_id: None,
+                                        bleed_reduction_db: default_bleed_reduction(),
+                                        bleed_alignment_offset_ms: 0.0,
                                         clips: vec![ClipSettings {
                                             source_start: 0.0,
                                             source_end: duration,
@@ -1795,7 +2038,7 @@ impl App {
     }
     fn write_session_to(&self, path: &std::path::Path) -> Result<(), String> {
         let session = SessionFile {
-            format_version: 15,
+            format_version: 16,
             sample_rate: self
                 .tracks
                 .first()
@@ -1882,7 +2125,7 @@ impl App {
                             std::fs::read(&source_path).map_err(|error| error.to_string())?;
                         let mut session: SessionFile = serde_json::from_slice(&data)
                             .map_err(|error| format!("Sesi tidak valid: {error}"))?;
-                        if !(1..=15).contains(&session.format_version) {
+                        if !(1..=16).contains(&session.format_version) {
                             return Err(format!(
                                 "Versi sesi {} belum didukung",
                                 session.format_version
@@ -1917,6 +2160,9 @@ impl App {
                         }
                         let mut tracks = Vec::new();
                         for mut settings in session.tracks {
+                            if settings.track_id == 0 {
+                                return Err(format!("ID track {:?} tidak valid", settings.name));
+                            }
                             if !matches!(settings.hum_frequency_hz, 50 | 60) {
                                 return Err(format!(
                                     "Frekuensi hum track {:?} tidak didukung",
@@ -1937,6 +2183,13 @@ impl App {
                                 || !(0.0..=18.0).contains(&settings.deesser_reduction_db)
                                 || !settings.dereverb_amount.is_finite()
                                 || !(0.0..=1.0).contains(&settings.dereverb_amount)
+                                || !settings.bleed_reduction_db.is_finite()
+                                || !(0.0..=24.0).contains(&settings.bleed_reduction_db)
+                                || !settings.bleed_alignment_offset_ms.is_finite()
+                                || !(-500.0..=500.0).contains(&settings.bleed_alignment_offset_ms)
+                                || (settings.bleed_enabled
+                                    && settings.bleed_reference_track_id.is_none())
+                                || settings.bleed_reference_track_id == Some(settings.track_id)
                                 || settings.gain_automation.iter().any(|point| {
                                     !point.time.is_finite()
                                         || point.time < 0.0
@@ -1945,7 +2198,7 @@ impl App {
                                 })
                             {
                                 return Err(format!(
-                                    "Pengaturan restorasi Tahap 3 track {:?} tidak valid",
+                                    "Pengaturan restorasi track {:?} tidak valid",
                                     settings.name
                                 ));
                             }
@@ -2040,6 +2293,26 @@ impl App {
                                 offline,
                             });
                         }
+                        let mut track_ids = std::collections::HashSet::new();
+                        for track in &tracks {
+                            if !track_ids.insert(track.settings.track_id) {
+                                return Err("Sesi memiliki ID track duplikat".into());
+                            }
+                        }
+                        for track in &tracks {
+                            if let Some(reference_id) = track.settings.bleed_reference_track_id
+                                && !track_ids.contains(&reference_id)
+                            {
+                                return Err(format!(
+                                    "Track referensi untuk {:?} tidak ditemukan",
+                                    track.settings.name
+                                ));
+                            }
+                        }
+                        if let Some(max_track_id) = track_ids.iter().max() {
+                            NEXT_TRACK_ID
+                                .fetch_max(max_track_id.saturating_add(1), Ordering::Relaxed);
+                        }
                         if session
                             .effect_a
                             .as_ref()
@@ -2048,7 +2321,7 @@ impl App {
                             return Err("Referensi A/B sesi tidak cocok dengan jumlah track".into());
                         }
                         if let Some(effects) = &session.effect_a
-                            && effects.iter().any(|effect| {
+                            && effects.iter().enumerate().any(|(index, effect)| {
                                 !matches!(effect.hum_frequency_hz, 50 | 60)
                                     || !effect.rumble_cutoff_hz.is_finite()
                                     || !effect.gate_threshold_db.is_finite()
@@ -2060,6 +2333,17 @@ impl App {
                                     || !(0.0..=18.0).contains(&effect.deesser_reduction_db)
                                     || !effect.dereverb_amount.is_finite()
                                     || !(0.0..=1.0).contains(&effect.dereverb_amount)
+                                    || !effect.bleed_reduction_db.is_finite()
+                                    || !(0.0..=24.0).contains(&effect.bleed_reduction_db)
+                                    || !effect.bleed_alignment_offset_ms.is_finite()
+                                    || !(-500.0..=500.0).contains(&effect.bleed_alignment_offset_ms)
+                                    || (effect.bleed_enabled
+                                        && effect.bleed_reference_track_id.is_none())
+                                    || effect.bleed_reference_track_id
+                                        == Some(tracks[index].settings.track_id)
+                                    || effect.bleed_reference_track_id.is_some_and(|reference_id| {
+                                        !track_ids.contains(&reference_id)
+                                    })
                                     || effect.denoise_profile_range.is_some_and(|(start, end)| {
                                         !start.is_finite()
                                             || !end.is_finite()
@@ -2901,6 +3185,7 @@ impl eframe::App for App {
             self.last_edit = Some(std::time::Instant::now());
         }
         let mut denoise_profile_request = None;
+        let mut alignment_request = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -3154,6 +3439,9 @@ impl eframe::App for App {
                 .then_some(self.snap_grid_interval);
             let timeline_track_height = self.timeline_track_height;
             let relink_enabled = !self.relink_in_progress && !self.import_in_progress;
+            let bleed_references = self.tracks.iter().enumerate().map(|(index, track)| {
+                (index, track.settings.track_id, track.settings.name.clone(), track.offline)
+            }).collect::<Vec<_>>();
             let mut snap_targets: Vec<(f64, Option<(usize, usize)>)> =
                 vec![(self.playhead_seconds, None)];
             snap_targets.extend(self.markers.iter().map(|marker| (marker.position, None)));
@@ -3230,7 +3518,8 @@ impl eframe::App for App {
                             + usize::from(track.settings.declick_enabled)
                             + usize::from(track.settings.declip_enabled)
                             + usize::from(track.settings.deesser_enabled)
-                            + usize::from(track.settings.dereverb_enabled);
+                            + usize::from(track.settings.dereverb_enabled)
+                            + usize::from(track.settings.bleed_enabled);
                         ui.collapsing(
                             format!("Restorasi · {active_restoration_count} aktif"),
                             |ui| {
@@ -3253,6 +3542,35 @@ impl eframe::App for App {
                             changed |= ui.checkbox(&mut track.settings.dereverb_enabled, "De-reverb").changed();
                             changed |= ui.add(egui::Slider::new(&mut track.settings.dereverb_amount, 0.0..=1.0).text("Reduksi tail")).changed();
                         });
+                        ui.horizontal(|ui| {
+                            let selected_reference = track.settings.bleed_reference_track_id
+                                .and_then(|id| bleed_references.iter().find(|(_, reference_id, _, _)| *reference_id == id))
+                                .map_or_else(|| "Pilih track referensi".to_owned(), |(_, _, name, _)| name.clone());
+                            egui::ComboBox::from_id_salt(("bleed-reference", index))
+                                .selected_text(selected_reference)
+                                .show_ui(ui, |ui| {
+                                    changed |= ui.selectable_value(&mut track.settings.bleed_reference_track_id, None, "Tanpa referensi").changed();
+                                    for (reference_index, reference_id, name, offline) in &bleed_references {
+                                        if *reference_index != index {
+                                            let label = if *offline { format!("{name} · offline") } else { name.clone() };
+                                            changed |= ui.add_enabled_ui(!*offline, |ui| ui.selectable_value(&mut track.settings.bleed_reference_track_id, Some(*reference_id), label)).inner.changed();
+                                        }
+                                    }
+                                });
+                            let has_reference = track.settings.bleed_reference_track_id.is_some();
+                            changed |= ui.add_enabled(has_reference, egui::Checkbox::new(&mut track.settings.bleed_enabled, "Kurangi bleed")).changed();
+                            if !has_reference { track.settings.bleed_enabled = false; }
+                        });
+                        ui.horizontal(|ui| {
+                            let alignment_ready = track.settings.bleed_reference_track_id.is_some_and(|reference_id| bleed_references.iter().any(|(_, id, _, offline)| *id == reference_id && !*offline));
+                            changed |= ui.add_enabled(track.settings.bleed_enabled, egui::Slider::new(&mut track.settings.bleed_reduction_db, 0.0..=24.0).text("Reduksi dB")).changed();
+                            changed |= ui.add_enabled(track.settings.bleed_enabled, egui::Slider::new(&mut track.settings.bleed_alignment_offset_ms, -500.0..=500.0).text("Offset referensi ms")).changed();
+                            if ui.add_enabled(track.settings.bleed_enabled && !track.offline && alignment_ready, egui::Button::new("Align otomatis")).on_hover_text("Mencari pergeseran referensi hingga ±500 ms dari 8 detik pertama.").clicked()
+                                && let Some(reference_id) = track.settings.bleed_reference_track_id {
+                                alignment_request = Some((index, reference_id));
+                            }
+                        });
+                        ui.weak("Offset mengikuti waktu sumber audio, terpisah dari posisi klip. Track referensi bisa di-mute jika tidak ingin masuk ke mix.");
                         ui.horizontal(|ui| {
                             changed |= egui::ComboBox::from_id_salt(("hum_frequency", index))
                                 .selected_text(format!(
@@ -3693,6 +4011,22 @@ impl eframe::App for App {
                     });
                 }
             });
+            if let Some((target_index, reference_id)) = alignment_request {
+                let offset = self.tracks.get(target_index).and_then(|target| {
+                    self.tracks.iter().find(|reference| reference.settings.track_id == reference_id)
+                        .filter(|reference| !reference.offline)
+                        .and_then(|reference| estimate_alignment_offset(&target.audio, &reference.audio))
+                });
+                if let Some(offset) = offset {
+                    if let Some(target) = self.tracks.get_mut(target_index) {
+                        target.settings.bleed_alignment_offset_ms = (offset * 1000.0).clamp(-500.0, 500.0) as f32;
+                        changed = true;
+                        self.status = Some(format!("Alignment referensi ditemukan: {:+.2} ms", offset * 1000.0));
+                    }
+                } else {
+                    self.status = Some("Alignment otomatis gagal: audio referensi terlalu pendek atau tidak berkorelasi".into());
+                }
+            }
             if let Some(index) = relink_request {
                 self.relink_track(index);
             }
@@ -4758,6 +5092,40 @@ fn process_effects_in_preview(
     Ok(output)
 }
 
+fn cached_track_effect_samples(
+    track: &Track,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Arc<SampleBuffer>, String> {
+    let channels = track.audio.channels as usize;
+    let mut samples = cached_pre_effect_samples(
+        std::path::Path::new(&track.settings.path),
+        &track.audio.samples,
+        channels,
+        track.audio.sample_rate,
+        &track.settings,
+        cancelled,
+    )?;
+    if !track.settings.denoise_bypass && track.settings.denoise_reduction_db > 0.0 {
+        let identity = pre_effect_cache_path(
+            std::path::Path::new(&track.settings.path),
+            track.audio.sample_rate,
+            channels,
+            &track.settings,
+        )
+        .ok_or_else(|| "Cache denoise tidak dapat dibuat untuk media ini".to_owned())?;
+        samples = cached_denoise_samples_controlled(
+            &identity,
+            &samples,
+            channels,
+            track.audio.sample_rate,
+            track.settings.denoise_reduction_db,
+            track.settings.denoise_profile_range,
+            cancelled,
+        )?;
+    }
+    Ok(samples)
+}
+
 fn prepare_mix_playback(
     tracks: &[Track],
     cancelled: Option<&AtomicBool>,
@@ -4828,33 +5196,52 @@ fn prepare_mix_playback_with_preview(
                 )?,
             )
         } else {
-            let mut samples = cached_pre_effect_samples(
-                std::path::Path::new(&track.settings.path),
+            (cached_track_effect_samples(track, cancelled)?, Vec::new())
+        };
+        let bleed_cancellation = if track.settings.bleed_enabled {
+            let reference_id = track
+                .settings
+                .bleed_reference_track_id
+                .ok_or_else(|| format!("Pilih track referensi untuk {:?}", track.settings.name))?;
+            let reference_track = tracks
+                .iter()
+                .find(|candidate| candidate.settings.track_id == reference_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Track referensi untuk {:?} tidak ditemukan",
+                        track.settings.name
+                    )
+                })?;
+            if reference_track.settings.track_id == track.settings.track_id
+                || reference_track.offline
+                || reference_track.audio.samples.is_empty()
+            {
+                return Err(format!(
+                    "Track referensi untuk {:?} tidak valid atau offline",
+                    track.settings.name
+                ));
+            }
+            let reference_samples = cached_track_effect_samples(reference_track, cancelled)?;
+            let (window_frames, weights) = estimate_bleed_weights(
                 &track.audio.samples,
                 channels,
                 track.audio.sample_rate,
-                &track.settings,
-                cancelled,
-            )?;
-            if !track.settings.denoise_bypass && track.settings.denoise_reduction_db > 0.0 {
-                let pre_effect_identity = pre_effect_cache_path(
-                    std::path::Path::new(&track.settings.path),
-                    track.audio.sample_rate,
-                    channels,
-                    &track.settings,
-                )
-                .ok_or_else(|| "Cache denoise tidak dapat dibuat untuk media ini".to_owned())?;
-                samples = cached_denoise_samples_controlled(
-                    &pre_effect_identity,
-                    &samples,
-                    channels,
-                    track.audio.sample_rate,
-                    track.settings.denoise_reduction_db,
-                    track.settings.denoise_profile_range,
-                    cancelled,
-                )?;
-            }
-            (samples, Vec::new())
+                &reference_samples,
+                reference_track.audio.channels as usize,
+                reference_track.audio.sample_rate,
+                track.settings.bleed_alignment_offset_ms as f64 / 1000.0,
+                track.settings.bleed_reduction_db,
+            );
+            Some(BleedCancellation {
+                reference_samples,
+                reference_channels: reference_track.audio.channels as usize,
+                reference_sample_rate: reference_track.audio.sample_rate,
+                alignment_offset_seconds: track.settings.bleed_alignment_offset_ms as f64 / 1000.0,
+                window_frames,
+                weights,
+            })
+        } else {
+            None
         };
         prepared.push(PreparedTrack {
             source_index,
@@ -4866,6 +5253,7 @@ fn prepare_mix_playback_with_preview(
             gain_left: track.settings.gain * (1.0 - track.settings.pan.clamp(-1.0, 1.0).max(0.0)),
             gain_right: track.settings.gain * (1.0 + track.settings.pan.clamp(-1.0, 1.0).min(0.0)),
             automation: track.settings.gain_automation.clone(),
+            bleed_cancellation,
             clips: track.settings.clips.clone(),
         });
     }
@@ -5995,18 +6383,20 @@ mod tests {
         App, Audio, AudioControls, ClipSettings, ExportSettings, GainPoint, MixPlayback,
         MixRequest, MixWorker, PreparedTrack, SampleBuffer, SampleStorage, SessionFile,
         SpectrogramCache, Track, TrackSettings, WaveformCache, build_spectrogram,
-        cached_denoise_samples_controlled, cached_pre_effect_samples, default_deesser_reduction,
-        default_deesser_threshold, default_dereverb_amount, denoise_cache_path, expander_samples,
-        gain_at_time, highpass_samples, make_render_state, noise_profile_range, peak_data,
-        peak_data_controlled, pre_effect_cache_path, process_effects_in_preview,
-        process_pre_denoise, process_stage3_effects, prune_sample_cache_with_limit,
-        read_media_audio, read_wav, render, render_mix, source_sample_cache_path, write_mix_wav_24,
-        write_mix_wav_controlled,
+        cached_denoise_samples_controlled, cached_pre_effect_samples, default_bleed_reduction,
+        default_deesser_reduction, default_deesser_threshold, default_dereverb_amount,
+        denoise_cache_path, estimate_alignment_offset, estimate_bleed_weights, expander_samples,
+        gain_at_time, highpass_samples, make_render_state, new_track_id, noise_profile_range,
+        peak_data, peak_data_controlled, pre_effect_cache_path, prepare_mix_playback,
+        process_effects_in_preview, process_pre_denoise, process_stage3_effects,
+        prune_sample_cache_with_limit, read_media_audio, read_wav, render, render_mix,
+        source_sample_cache_path, write_mix_wav_24, write_mix_wav_controlled,
     };
     use std::sync::{Arc, atomic::Ordering};
 
     fn basic_settings() -> TrackSettings {
         TrackSettings {
+            track_id: new_track_id(),
             name: "test".into(),
             path: "test.wav".into(),
             gain: 1.0,
@@ -6030,6 +6420,10 @@ mod tests {
             dereverb_enabled: false,
             dereverb_amount: 0.35,
             gain_automation: Vec::new(),
+            bleed_enabled: false,
+            bleed_reference_track_id: None,
+            bleed_reduction_db: default_bleed_reduction(),
+            bleed_alignment_offset_ms: 0.0,
             clips: Vec::new(),
         }
     }
@@ -6074,6 +6468,7 @@ mod tests {
                         gain: 2.0,
                     },
                 ],
+                bleed_cancellation: None,
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 4.0,
@@ -6115,6 +6510,132 @@ mod tests {
         assert!(migrated.gain_automation.is_empty());
         assert_eq!(migrated.deesser_threshold_db, -24.0);
         assert_eq!(migrated.dereverb_amount, 0.35);
+    }
+
+    #[test]
+    fn automatic_alignment_finds_reference_offset() {
+        let mut seed = 0x1234_5678u32;
+        let reference_values = (0..16_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed as i32 as f32) / i32::MAX as f32
+            })
+            .collect::<Vec<_>>();
+        let delay_frames = 80;
+        let target_values = (0..reference_values.len())
+            .map(|index| {
+                reference_values
+                    .get(index + delay_frames)
+                    .copied()
+                    .unwrap_or(0.0)
+            })
+            .collect::<Vec<_>>();
+        let make_audio = |values: Vec<f32>| Audio {
+            samples: Arc::new(SampleBuffer::owned(values)),
+            sample_rate: 4_000,
+            channels: 1,
+        };
+        let offset =
+            estimate_alignment_offset(&make_audio(target_values), &make_audio(reference_values))
+                .unwrap();
+        assert!((offset - 0.02).abs() <= 0.0025, "estimated {offset:.6}s");
+    }
+
+    #[test]
+    fn reference_track_bleed_reduction_cancels_correlated_component() {
+        let rate = 1_000u32;
+        let reference = (0..2_000)
+            .map(|frame| (std::f32::consts::TAU * 50.0 * frame as f32 / rate as f32).sin() * 0.4)
+            .collect::<Vec<_>>();
+        let target = (0..2_000)
+            .map(|frame| {
+                let desired =
+                    (std::f32::consts::TAU * 200.0 * frame as f32 / rate as f32).sin() * 0.25;
+                desired + reference[frame] * 0.5
+            })
+            .collect::<Vec<_>>();
+        let (window, weights) =
+            estimate_bleed_weights(&target, 1, rate, &reference, 1, rate, 0.0, 24.0);
+        let corrected = target
+            .iter()
+            .enumerate()
+            .map(|(frame, value)| value - reference[frame] * weights[frame / window])
+            .collect::<Vec<_>>();
+        let correlation = |samples: &[f32]| {
+            samples
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+                .abs()
+        };
+        assert!(
+            correlation(&corrected) < correlation(&target) * 0.2,
+            "{} vs {}",
+            correlation(&corrected),
+            correlation(&target)
+        );
+    }
+
+    #[test]
+    fn prepared_mix_uses_another_track_as_bleed_reference() {
+        let rate = 1_000u32;
+        let reference_samples = (0..2_000)
+            .map(|frame| (std::f32::consts::TAU * 50.0 * frame as f32 / rate as f32).sin() * 0.4)
+            .collect::<Vec<_>>();
+        let target_samples = (0..2_000)
+            .map(|frame| {
+                let desired =
+                    (std::f32::consts::TAU * 200.0 * frame as f32 / rate as f32).sin() * 0.25;
+                desired + reference_samples[frame] * 0.5
+            })
+            .collect::<Vec<_>>();
+        let reference_id = new_track_id();
+        let mut target_settings = basic_settings();
+        target_settings.bleed_enabled = true;
+        target_settings.bleed_reference_track_id = Some(reference_id);
+        target_settings.bleed_reduction_db = 24.0;
+        target_settings.clips = vec![ClipSettings {
+            source_start: 0.0,
+            source_end: 2.0,
+            position: 0.0,
+            fade_in_seconds: 0.0,
+            fade_out_seconds: 0.0,
+            gain: 1.0,
+        }];
+        let mut reference_settings = basic_settings();
+        reference_settings.track_id = reference_id;
+        reference_settings.clips = target_settings.clips.clone();
+        let make_track = |settings, samples| Track {
+            settings,
+            audio: Audio {
+                samples: Arc::new(SampleBuffer::owned(samples)),
+                sample_rate: rate,
+                channels: 1,
+            },
+            waveform: Arc::new(WaveformCache::default()),
+            spectrogram: Arc::new(SpectrogramCache::default()),
+            offline: false,
+        };
+        let tracks = [
+            make_track(target_settings, target_samples),
+            make_track(reference_settings, reference_samples.clone()),
+        ];
+        let mix = prepare_mix_playback(&tracks, None).unwrap();
+        let corrected = (0..2_000)
+            .map(|frame| mix.tracks[0].sample(frame, 0, frame as f64 / rate as f64))
+            .collect::<Vec<_>>();
+        let correlation = |samples: &[f32]| {
+            samples
+                .iter()
+                .zip(&reference_samples)
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+                .abs()
+        };
+        assert!(correlation(&corrected) < correlation(&tracks[0].audio.samples) * 0.2);
     }
 
     #[test]
@@ -6263,6 +6784,7 @@ mod tests {
     fn preview_effects_leave_unselected_audio_dry() {
         let source = Arc::new(SampleBuffer::owned(vec![0.25; 1000]));
         let settings = TrackSettings {
+            track_id: new_track_id(),
             name: "preview".into(),
             path: "preview.wav".into(),
             gain: 1.0,
@@ -6286,6 +6808,10 @@ mod tests {
             dereverb_enabled: false,
             dereverb_amount: default_dereverb_amount(),
             gain_automation: Vec::new(),
+            bleed_enabled: false,
+            bleed_reference_track_id: None,
+            bleed_reduction_db: default_bleed_reduction(),
+            bleed_alignment_offset_ms: 0.0,
             clips: vec![ClipSettings {
                 source_start: 0.0,
                 source_end: 1.0,
@@ -6315,6 +6841,7 @@ mod tests {
             gain_left: 1.0,
             gain_right: 1.0,
             automation: Vec::new(),
+            bleed_cancellation: None,
             clips: settings.clips,
         };
         assert_eq!(track.sample(100, 0, 0.1), 0.25);
@@ -6353,6 +6880,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let settings = TrackSettings {
+            track_id: new_track_id(),
             name: "test".into(),
             path: source_path.display().to_string(),
             gain: 1.0,
@@ -6376,6 +6904,10 @@ mod tests {
             dereverb_enabled: true,
             dereverb_amount: default_dereverb_amount(),
             gain_automation: Vec::new(),
+            bleed_enabled: false,
+            bleed_reference_track_id: None,
+            bleed_reduction_db: default_bleed_reduction(),
+            bleed_alignment_offset_ms: 0.0,
             clips: Vec::new(),
         };
         let expected =
@@ -6542,6 +7074,7 @@ mod tests {
         writer.finalize().unwrap();
         let audio = read_wav(&source_path).unwrap();
         let settings = TrackSettings {
+            track_id: new_track_id(),
             name: "pipeline".into(),
             path: source_path.display().to_string(),
             gain: 1.0,
@@ -6565,6 +7098,10 @@ mod tests {
             dereverb_enabled: false,
             dereverb_amount: default_dereverb_amount(),
             gain_automation: Vec::new(),
+            bleed_enabled: false,
+            bleed_reference_track_id: None,
+            bleed_reduction_db: default_bleed_reduction(),
+            bleed_alignment_offset_ms: 0.0,
             clips: vec![ClipSettings {
                 source_start: 0.0,
                 source_end: audio.samples.len() as f64
@@ -6703,8 +7240,11 @@ mod tests {
         let track: TrackSettings = serde_json::from_str(
             r#"{"name":"Host","path":"host.wav","gain":1.0,"pan":0.0,"mute":false,"solo":false,"clips":[]}"#,
         ).unwrap();
+        assert_ne!(track.track_id, 0);
         assert_eq!(track.rumble_cutoff_hz, 0.0);
         assert!(track.rumble_bypass);
+        assert!(!track.bleed_enabled);
+        assert!(track.bleed_reference_track_id.is_none());
         assert_eq!(track.gate_threshold_db, -45.0);
         assert!(track.gate_bypass);
 
@@ -6722,8 +7262,11 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("izotay-session-{nonce}.izotay"));
         let mut app = App::default();
+        let dialog_track_id = new_track_id();
+        let reference_track_id = new_track_id();
         app.tracks.push(Track {
             settings: TrackSettings {
+                track_id: dialog_track_id,
                 name: "dialog".into(),
                 path: "/media/dialog.wav".into(),
                 gain: 1.0,
@@ -6756,6 +7299,10 @@ mod tests {
                         gain: 1.25,
                     },
                 ],
+                bleed_enabled: true,
+                bleed_reference_track_id: Some(reference_track_id),
+                bleed_reduction_db: 9.0,
+                bleed_alignment_offset_ms: 23.5,
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 4.0,
@@ -6774,15 +7321,29 @@ mod tests {
             spectrogram: Arc::new(SpectrogramCache::default()),
             offline: false,
         });
+        let mut reference_track = app.tracks[0].clone();
+        reference_track.settings.track_id = reference_track_id;
+        reference_track.settings.name = "reference".into();
+        reference_track.settings.path = "/media/reference.wav".into();
+        reference_track.settings.bleed_enabled = false;
+        reference_track.settings.bleed_reference_track_id = None;
+        app.tracks.push(reference_track);
         app.write_session_to(&path).unwrap();
         let session: SessionFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(session.format_version, 15);
-        assert_eq!(session.tracks.len(), 1);
+        assert_eq!(session.format_version, 16);
+        assert_eq!(session.tracks.len(), 2);
         assert_eq!(session.tracks[0].denoise_profile_range, Some((1.25, 2.75)));
         assert!(session.tracks[0].declick_enabled);
         assert!(session.tracks[0].deesser_enabled);
         assert!(session.tracks[0].dereverb_enabled);
         assert_eq!(session.tracks[0].gain_automation.len(), 2);
+        assert_eq!(session.tracks[0].track_id, dialog_track_id);
+        assert_eq!(
+            session.tracks[0].bleed_reference_track_id,
+            Some(reference_track_id)
+        );
+        assert_eq!(session.tracks[0].bleed_reduction_db, 9.0);
+        assert_eq!(session.tracks[0].bleed_alignment_offset_ms, 23.5);
         drop(app);
         std::fs::remove_file(path).unwrap();
     }
@@ -6802,6 +7363,7 @@ mod tests {
                 gain_left: 1.0,
                 gain_right: 1.0,
                 automation: Vec::new(),
+                bleed_cancellation: None,
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,
@@ -6840,6 +7402,7 @@ mod tests {
                 gain_left: 1.0,
                 gain_right: 1.0,
                 automation: Vec::new(),
+                bleed_cancellation: None,
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,
@@ -6899,6 +7462,7 @@ mod tests {
                 gain_left: 1.0,
                 gain_right: 1.0,
                 automation: Vec::new(),
+                bleed_cancellation: None,
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,
@@ -6923,6 +7487,7 @@ mod tests {
     fn mix_respects_clip_timeline_position_and_reports_clipping() {
         let track = Track {
             settings: TrackSettings {
+                track_id: new_track_id(),
                 name: "Host".into(),
                 path: "host.wav".into(),
                 gain: 1.0,
@@ -6946,6 +7511,10 @@ mod tests {
                 dereverb_enabled: false,
                 dereverb_amount: default_dereverb_amount(),
                 gain_automation: Vec::new(),
+                bleed_enabled: false,
+                bleed_reference_track_id: None,
+                bleed_reduction_db: default_bleed_reduction(),
+                bleed_alignment_offset_ms: 0.0,
                 clips: vec![ClipSettings {
                     source_start: 0.0,
                     source_end: 1.0,
