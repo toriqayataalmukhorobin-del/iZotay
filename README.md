@@ -10,9 +10,12 @@ iZotay adalah prototipe editor desktop lokal untuk dialog, podcast, wawancara, d
 - Restorasi per track: high-pass rumble, notch hum 50/60 Hz, expander, denoise FFmpeg `afftdn`, de-click, de-clip, de-esser, dan penekan tail reverb ringan. Kontrol menyediakan bypass, A/B, dan profil noise dari seleksi.
 - Otomasi gain per track dengan titik pada playhead, interpolasi linear, tampilan kurva di klip, undo/redo, dan penyimpanan sesi.
 - Bleed reduction per track memakai track referensi, reduksi 0–24 dB, offset manual ±500 ms, dan alignment otomatis berbasis korelasi hingga ±500 ms.
+- Preset restorasi portabel (`.izopreset`) dapat disimpan dari track dan diterapkan ke track lain. Batch processing memakai satu preset untuk banyak sumber audio/video dan membuat WAV PCM 24-bit.
+- Konsolidasi proyek menyalin sumber media ke folder `Media` bersama sesi `.izotay` dengan path relatif agar folder mudah dipindahkan; file asli tetap utuh.
+- Aksesibilitas menyediakan dukungan AccessKit untuk teknologi bantu, kontras tinggi, skala UI 80–160%, target kontrol yang lebih besar, serta shortcut yang tidak mengambil alih pengetikan di kolom teks.
 - Preview dapat dibatasi ke seleksi; ekspor menerapkan efek aktif ke seluruh rentang ekspor.
 - Playback, meter peak, ekspor mix atau track ke WAV PCM 16/24/32-bit, normalisasi peak, dan ekspor audio hasil edit ke MP4.
-- Sesi versi 16 dapat menyimpan pengaturan timeline, klip, marker, efek, profil noise, otomasi gain, referensi bleed, alignment, dan pengaturan ekspor. Sesi versi 1–15 tetap dibaca; fitur baru memakai nilai aman saat membuka sesi lama.
+- Sesi versi 17 dapat menyimpan pengaturan timeline, klip, marker, efek, profil noise, otomasi gain, referensi bleed, alignment, preferensi aksesibilitas, dan pengaturan ekspor. Sesi versi 1–16 tetap dibaca; fitur baru memakai nilai aman saat membuka sesi lama.
 - Sumber media, waveform, dan hasil DSP memakai cache file-backed. Pemrosesan full-track berjalan bertahap; cache sampel dibatasi sekitar 4 GiB secara best-effort.
 
 ## Batasan saat ini
@@ -20,6 +23,7 @@ iZotay adalah prototipe editor desktop lokal untuk dialog, podcast, wawancara, d
 - Preview gambar video belum tersedia. Aplikasi mengedit audio dari video saja.
 - De-click/de-clip memakai rekonstruksi sampel terisolasi, de-esser memakai deteksi energi high-band, dan de-reverb menekan level tail yang pelan. Dengarkan hasilnya pada materi sasaran sebelum produksi.
 - Bleed reduction paling efektif bila referensi berisi sumber bleed yang sama dengan timing dekat. Periksa hasilnya karena komponen suara yang berkorelasi memang akan dikurangi dari track target.
+- Batch processing mengeluarkan WAV PCM 24-bit per sumber, menggunakan efek preset tanpa relasi track referensi atau profil noise berbasis seleksi. Konsolidasi menyalin media dan sesi; FFmpeg dan cache sementara tetap dikelola terpisah.
 - Preview efek untuk seleksi yang sangat panjang masih menyimpan hasil seleksi di memori.
 - Cache berada di direktori sementara dan dapat dibangun ulang; gunakan file sesi dan media sumber sebagai data proyek utama.
 - FFmpeg harus tersedia di `PATH` untuk format non-WAV, audio video, denoise, dan ekspor MP4.
@@ -65,7 +69,7 @@ Keputusan teknis dan batas yang diketahui ada di [KEPUTUSAN-TEKNIS.md](KEPUTUSAN
 - [x] Tahap 2 — Restorasi inti, preview A/B, meter, cache waveform dan media panjang, pemrosesan DSP bertahap.
 - [x] Tahap 3 — Spectrogram, de-click, de-clip, de-esser, de-reverb, dan otomasi gain.
 - [x] Tahap 4 — Bleed reduction dengan track referensi dan alignment.
-- [ ] Tahap 5 — Preset produksi, batch processing, konsolidasi aset, dan aksesibilitas.
+- [x] Tahap 5 — Preset produksi, batch processing, konsolidasi aset, dan aksesibilitas.
 
 ## Lisensi
 

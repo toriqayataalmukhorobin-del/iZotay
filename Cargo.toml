@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 cpal = "0.15"
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow", "x11", "wayland"] }
 hound = "3.5"
 memmap2 = "0.9"
 rfd = "0.15"

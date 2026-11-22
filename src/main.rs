@@ -667,6 +667,46 @@ impl TrackSettings {
         self.bleed_alignment_offset_ms = effects.bleed_alignment_offset_ms;
     }
 }
+fn new_track_settings(name: String, path: String, duration: f64) -> TrackSettings {
+    TrackSettings {
+        track_id: new_track_id(),
+        name,
+        path,
+        gain: 1.0,
+        pan: 0.0,
+        mute: false,
+        solo: false,
+        rumble_cutoff_hz: 0.0,
+        rumble_bypass: true,
+        hum_frequency_hz: 50,
+        hum_bypass: true,
+        gate_threshold_db: -45.0,
+        gate_bypass: true,
+        denoise_reduction_db: default_denoise_reduction(),
+        denoise_bypass: true,
+        denoise_profile_range: None,
+        declick_enabled: false,
+        declip_enabled: false,
+        deesser_enabled: false,
+        deesser_threshold_db: default_deesser_threshold(),
+        deesser_reduction_db: default_deesser_reduction(),
+        dereverb_enabled: false,
+        dereverb_amount: default_dereverb_amount(),
+        gain_automation: Vec::new(),
+        bleed_enabled: false,
+        bleed_reference_track_id: None,
+        bleed_reduction_db: default_bleed_reduction(),
+        bleed_alignment_offset_ms: 0.0,
+        clips: vec![ClipSettings {
+            source_start: 0.0,
+            source_end: duration,
+            position: 0.0,
+            fade_in_seconds: 0.0,
+            fade_out_seconds: 0.0,
+            gain: 1.0,
+        }],
+    }
+}
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct GainPoint {
     time: f64,
@@ -870,12 +910,25 @@ struct SessionFile {
     snap_grid_interval: f64,
     #[serde(default = "default_timeline_track_height")]
     timeline_track_height: f32,
+    #[serde(default = "default_ui_scale")]
+    ui_scale: f32,
+    #[serde(default)]
+    high_contrast: bool,
+}
+#[derive(Serialize, Deserialize)]
+struct ProductionPreset {
+    format_version: u32,
+    name: String,
+    effects: EffectSettings,
 }
 fn default_timeline_zoom() -> f32 {
     1.0
 }
 fn default_timeline_track_height() -> f32 {
     72.0
+}
+fn default_ui_scale() -> f32 {
+    1.0
 }
 fn default_snap_grid_interval() -> f64 {
     0.5
@@ -1124,11 +1177,14 @@ struct LoadedSession {
     snap_grid_enabled: bool,
     snap_grid_interval: f64,
     timeline_track_height: f32,
+    ui_scale: f32,
+    high_contrast: bool,
     path: std::path::PathBuf,
     recovered: bool,
 }
 enum ExportMessage {
     Progress(f32),
+    Status(String),
     Finished(Result<(), String>),
 }
 #[derive(Clone, Copy)]
@@ -1255,6 +1311,8 @@ struct App {
     snap_grid_enabled: bool,
     snap_grid_interval: f64,
     timeline_track_height: f32,
+    ui_scale: f32,
+    high_contrast: bool,
     spectrogram_view: bool,
     automation_gain_value: f32,
     preview_selection_only: bool,
@@ -1273,6 +1331,7 @@ struct App {
     export_in_progress: bool,
     export_cancel: Option<Arc<AtomicBool>>,
     export_progress: f32,
+    export_summary: Option<String>,
     export_sample_rate: u32,
     export_bit_depth: u16,
     export_normalize_peak: bool,
@@ -1286,6 +1345,12 @@ struct App {
     relink_in_progress: bool,
     session_result: Option<Receiver<Result<LoadedSession, String>>>,
     session_opening: bool,
+    consolidation_result: Option<Receiver<Result<ConsolidationResult, String>>>,
+    consolidation_in_progress: bool,
+}
+struct ConsolidationResult {
+    paths: Vec<String>,
+    session_path: std::path::PathBuf,
 }
 impl Default for App {
     fn default() -> Self {
@@ -1309,6 +1374,8 @@ impl Default for App {
             snap_grid_enabled: false,
             snap_grid_interval: default_snap_grid_interval(),
             timeline_track_height: default_timeline_track_height(),
+            ui_scale: default_ui_scale(),
+            high_contrast: false,
             spectrogram_view: false,
             automation_gain_value: 1.0,
             preview_selection_only: false,
@@ -1327,6 +1394,7 @@ impl Default for App {
             export_in_progress: false,
             export_cancel: None,
             export_progress: 0.0,
+            export_summary: None,
             export_sample_rate: 0,
             export_bit_depth: 24,
             export_normalize_peak: false,
@@ -1340,6 +1408,8 @@ impl Default for App {
             relink_in_progress: false,
             session_result: None,
             session_opening: false,
+            consolidation_result: None,
+            consolidation_in_progress: false,
         }
     }
 }
@@ -1786,6 +1856,7 @@ impl App {
         self.export_result = Some(receiver);
         self.export_cancel = Some(cancel);
         self.export_progress = 0.0;
+        self.export_summary = None;
         self.export_in_progress = true;
         self.status = Some("Ekspor berjalan di latar belakang".into());
     }
@@ -1812,6 +1883,10 @@ impl App {
                 ExportMessage::Progress(progress) => {
                     self.export_progress = progress.clamp(0.0, 1.0)
                 }
+                ExportMessage::Status(status) => {
+                    self.status = Some(status.clone());
+                    self.export_summary = Some(status);
+                }
                 ExportMessage::Finished(result) => {
                     self.export_result = None;
                     self.export_cancel = None;
@@ -1820,7 +1895,11 @@ impl App {
                         Ok(()) => {
                             self.export_progress = 1.0;
                             self.error = None;
-                            self.status = Some("Ekspor selesai".into());
+                            self.status = Some(
+                                self.export_summary
+                                    .take()
+                                    .unwrap_or_else(|| "Ekspor selesai".into()),
+                            );
                         }
                         Err(error) if error == "Ekspor dibatalkan" => {
                             self.error = None;
@@ -1899,44 +1978,11 @@ impl App {
                                     audio.sample_rate,
                                 ));
                                 result.tracks.push(Track {
-                                    settings: TrackSettings {
-                                        track_id: new_track_id(),
+                                    settings: new_track_settings(
                                         name,
-                                        path: path.display().to_string(),
-                                        gain: 1.0,
-                                        pan: 0.0,
-                                        mute: false,
-                                        solo: false,
-                                        rumble_cutoff_hz: 0.0,
-                                        rumble_bypass: true,
-                                        hum_frequency_hz: 50,
-                                        hum_bypass: true,
-                                        gate_threshold_db: -45.0,
-                                        gate_bypass: true,
-                                        denoise_reduction_db: default_denoise_reduction(),
-                                        denoise_bypass: true,
-                                        denoise_profile_range: None,
-                                        declick_enabled: false,
-                                        declip_enabled: false,
-                                        deesser_enabled: false,
-                                        deesser_threshold_db: default_deesser_threshold(),
-                                        deesser_reduction_db: default_deesser_reduction(),
-                                        dereverb_enabled: false,
-                                        dereverb_amount: default_dereverb_amount(),
-                                        gain_automation: Vec::new(),
-                                        bleed_enabled: false,
-                                        bleed_reference_track_id: None,
-                                        bleed_reduction_db: default_bleed_reduction(),
-                                        bleed_alignment_offset_ms: 0.0,
-                                        clips: vec![ClipSettings {
-                                            source_start: 0.0,
-                                            source_end: duration,
-                                            position: 0.0,
-                                            fade_in_seconds: 0.0,
-                                            fade_out_seconds: 0.0,
-                                            gain: 1.0,
-                                        }],
-                                    },
+                                        path.display().to_string(),
+                                        duration,
+                                    ),
                                     waveform,
                                     spectrogram,
                                     audio,
@@ -2038,13 +2084,13 @@ impl App {
     }
     fn write_session_to(&self, path: &std::path::Path) -> Result<(), String> {
         let session = SessionFile {
-            format_version: 16,
+            format_version: 17,
             sample_rate: self
                 .tracks
                 .first()
                 .map(|t| t.audio.sample_rate)
                 .unwrap_or(48000),
-            tracks: self.tracks.iter().map(|t| t.settings.clone()).collect(),
+            tracks: session_track_settings(&self.tracks, path),
             markers: self.markers.clone(),
             export_sample_rate: self.export_sample_rate,
             export_bit_depth: self.export_bit_depth,
@@ -2055,6 +2101,8 @@ impl App {
             snap_grid_enabled: self.snap_grid_enabled,
             snap_grid_interval: self.snap_grid_interval,
             timeline_track_height: self.timeline_track_height,
+            ui_scale: self.ui_scale,
+            high_contrast: self.high_contrast,
         };
         let bytes = serde_json::to_vec_pretty(&session).map_err(|e| e.to_string())?;
         let temp = path.with_extension("izotay.tmp");
@@ -2075,6 +2123,89 @@ impl App {
             let _ = std::fs::remove_file(backup);
         }
         Ok(())
+    }
+    fn consolidate_assets(&mut self) {
+        if self.consolidation_in_progress
+            || self.export_in_progress
+            || self.import_in_progress
+            || self.session_opening
+            || self.tracks.is_empty()
+        {
+            return;
+        }
+        if self.tracks.iter().any(|track| track.offline) {
+            self.error = Some("Tautkan ulang semua media offline sebelum konsolidasi aset".into());
+            return;
+        }
+        let Some(parent) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let session = SessionFile {
+            format_version: 17,
+            sample_rate: self
+                .tracks
+                .first()
+                .map(|track| track.audio.sample_rate)
+                .unwrap_or(48_000),
+            tracks: self
+                .tracks
+                .iter()
+                .map(|track| track.settings.clone())
+                .collect(),
+            markers: self.markers.clone(),
+            export_sample_rate: self.export_sample_rate,
+            export_bit_depth: self.export_bit_depth,
+            normalize_peak: self.export_normalize_peak,
+            effect_a: self.effect_a.clone(),
+            timeline_zoom: self.timeline_zoom,
+            snap_enabled: self.snap_enabled,
+            snap_grid_enabled: self.snap_grid_enabled,
+            snap_grid_interval: self.snap_grid_interval,
+            timeline_track_height: self.timeline_track_height,
+            ui_scale: self.ui_scale,
+            high_contrast: self.high_contrast,
+        };
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("izotay-consolidate-assets".into())
+            .spawn(move || {
+                let _ = sender.send(consolidate_session_bundle(&parent, session));
+            })
+            .expect("gagal membuat worker konsolidasi aset");
+        self.consolidation_result = Some(receiver);
+        self.consolidation_in_progress = true;
+        self.status = Some("Menyalin media ke folder proyek baru…".into());
+        self.error = None;
+    }
+    fn poll_consolidation(&mut self) {
+        let result = match self.consolidation_result.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.consolidation_result = None;
+                self.consolidation_in_progress = false;
+                self.error = Some("Worker konsolidasi berhenti sebelum selesai".into());
+                return;
+            }
+            _ => return,
+        };
+        self.consolidation_result = None;
+        self.consolidation_in_progress = false;
+        match result {
+            Ok(result) => {
+                self.checkpoint();
+                for (track, path) in self.tracks.iter_mut().zip(result.paths) {
+                    track.settings.path = path;
+                }
+                self.session_path = Some(result.session_path.clone());
+                self.last_edit = None;
+                self.error = None;
+                self.status = Some(format!(
+                    "Proyek mandiri dibuat: {}",
+                    result.session_path.display()
+                ));
+            }
+            Err(error) => self.error = Some(format!("Konsolidasi aset gagal: {error}")),
+        }
     }
     fn autosave_if_due(&mut self) {
         let Some(edited_at) = self.last_edit else {
@@ -2106,6 +2237,10 @@ impl App {
             .add_filter("iZotay session", &["izotay"])
             .pick_file()
         {
+            let session_directory = path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
             let recovery_path = autosave_path(&path);
             let recovered = match (std::fs::metadata(&path), std::fs::metadata(&recovery_path)) {
                 (Ok(base), Ok(recovery)) => recovery.modified().ok() > base.modified().ok(),
@@ -2125,7 +2260,7 @@ impl App {
                             std::fs::read(&source_path).map_err(|error| error.to_string())?;
                         let mut session: SessionFile = serde_json::from_slice(&data)
                             .map_err(|error| format!("Sesi tidak valid: {error}"))?;
-                        if !(1..=16).contains(&session.format_version) {
+                        if !(1..=17).contains(&session.format_version) {
                             return Err(format!(
                                 "Versi sesi {} belum didukung",
                                 session.format_version
@@ -2155,11 +2290,20 @@ impl App {
                         {
                             return Err("Tinggi track pada sesi tidak valid".into());
                         }
+                        if !session.ui_scale.is_finite() || !(0.8..=1.6).contains(&session.ui_scale)
+                        {
+                            return Err("Skala antarmuka pada sesi tidak valid".into());
+                        }
                         if ![0.1, 0.25, 0.5, 1.0, 2.0].contains(&session.snap_grid_interval) {
                             return Err("Interval snap grid pada sesi tidak valid".into());
                         }
                         let mut tracks = Vec::new();
                         for mut settings in session.tracks {
+                            let stored_path = std::path::PathBuf::from(&settings.path);
+                            if stored_path.is_relative() {
+                                settings.path =
+                                    session_directory.join(stored_path).display().to_string();
+                            }
                             if settings.track_id == 0 {
                                 return Err(format!("ID track {:?} tidak valid", settings.name));
                             }
@@ -2379,6 +2523,8 @@ impl App {
                             snap_grid_enabled: session.snap_grid_enabled,
                             snap_grid_interval: session.snap_grid_interval,
                             timeline_track_height: session.timeline_track_height,
+                            ui_scale: session.ui_scale,
+                            high_contrast: session.high_contrast,
                             path,
                             recovered,
                         })
@@ -2419,6 +2565,8 @@ impl App {
                     self.snap_grid_enabled = loaded.snap_grid_enabled;
                     self.snap_grid_interval = loaded.snap_grid_interval;
                     self.timeline_track_height = loaded.timeline_track_height;
+                    self.ui_scale = loaded.ui_scale;
+                    self.high_contrast = loaded.high_contrast;
                     self.ab_showing_a = false;
                     self.time_selection = None;
                     self.export_selection_only = false;
@@ -2506,6 +2654,228 @@ impl App {
                 write_mix_wav_controlled(&playback, &path, settings, &cancel, &progress)
             });
         }
+    }
+    fn save_selected_preset(&mut self) {
+        let Some(track) = self.selected_track.and_then(|index| self.tracks.get(index)) else {
+            return;
+        };
+        let mut effects = track.settings.effect_settings();
+        effects.denoise_profile_range = None;
+        effects.bleed_enabled = false;
+        effects.bleed_reference_track_id = None;
+        effects.bleed_alignment_offset_ms = 0.0;
+        let safe_name = track
+            .settings
+            .name
+            .chars()
+            .map(|character| {
+                if character.is_control() || matches!(character, '/' | '\\') {
+                    '_'
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        let preset_name = if safe_name.trim().is_empty() {
+            "Preset Restorasi"
+        } else {
+            safe_name.trim()
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Preset restorasi iZotay", &["izopreset"])
+            .set_file_name(format!("{preset_name}.izopreset"))
+            .save_file()
+        else {
+            return;
+        };
+        let preset = ProductionPreset {
+            format_version: 1,
+            name: preset_name.chars().take(64).collect(),
+            effects,
+        };
+        match write_production_preset(&preset, &path) {
+            Ok(()) => {
+                self.error = None;
+                self.status = Some(format!("Preset disimpan: {}", path.display()));
+            }
+            Err(error) => self.error = Some(format!("Preset gagal disimpan: {error}")),
+        }
+    }
+    fn apply_preset_to_selected(&mut self) {
+        let Some(index) = self.selected_track else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Preset restorasi iZotay", &["izopreset"])
+            .pick_file()
+        else {
+            return;
+        };
+        match read_production_preset(&path) {
+            Ok(preset) => {
+                self.checkpoint();
+                if let Some(track) = self.tracks.get_mut(index) {
+                    track.settings.apply_effect_settings(&preset.effects);
+                    track.settings.denoise_profile_range = None;
+                    track.settings.bleed_enabled = false;
+                    track.settings.bleed_reference_track_id = None;
+                    track.settings.bleed_alignment_offset_ms = 0.0;
+                }
+                self.ab_showing_a = false;
+                self.rebuild_mix();
+                self.status = Some(format!("Preset '{}' diterapkan", preset.name));
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("Preset tidak dapat dibuka: {error}")),
+        }
+    }
+    fn start_batch_processing(&mut self) {
+        if self.export_in_progress || self.import_in_progress || self.session_opening {
+            return;
+        }
+        let Some(preset_path) = rfd::FileDialog::new()
+            .add_filter("Preset restorasi iZotay", &["izopreset"])
+            .pick_file()
+        else {
+            return;
+        };
+        let preset = match read_production_preset(&preset_path) {
+            Ok(preset) => preset,
+            Err(error) => {
+                self.error = Some(format!("Preset tidak dapat dibuka: {error}"));
+                return;
+            }
+        };
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter(
+                "Audio dan video",
+                &[
+                    "wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "mp4", "mov", "mkv", "webm",
+                    "avi",
+                ],
+            )
+            .pick_files()
+        else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let Some(output_dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let total = paths.len();
+        self.start_export(move |progress, cancelled| {
+            let mut completed = 0usize;
+            let mut failures = Vec::new();
+            for (index, path) in paths.iter().enumerate() {
+                if cancelled.load(Ordering::Relaxed) {
+                    let _ = progress.send(ExportMessage::Status(format!(
+                        "Batch dibatalkan; {completed}/{total} berkas berhasil disimpan"
+                    )));
+                    return Ok(());
+                }
+                let _ = progress.send(ExportMessage::Progress(index as f32 / total as f32));
+                let _ = progress.send(ExportMessage::Status(format!(
+                    "Batch: memproses {} ({}/{total})",
+                    path.file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("audio"),
+                    index + 1
+                )));
+                let result = (|| -> Result<(), String> {
+                    let audio = read_media_audio_controlled(path, Some(&cancelled))?;
+                    let duration = audio.samples.len() as f64
+                        / audio.channels.max(1) as f64
+                        / audio.sample_rate.max(1) as f64;
+                    let name = path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("audio")
+                        .to_owned();
+                    let mut settings =
+                        new_track_settings(name, path.display().to_string(), duration);
+                    settings.apply_effect_settings(&preset.effects);
+                    settings.denoise_profile_range = None;
+                    settings.bleed_enabled = false;
+                    settings.bleed_reference_track_id = None;
+                    settings.bleed_alignment_offset_ms = 0.0;
+                    let track = Track {
+                        settings,
+                        audio,
+                        waveform: Arc::new(WaveformCache::default()),
+                        spectrogram: Arc::new(SpectrogramCache::default()),
+                        offline: false,
+                    };
+                    let playback = prepare_mix_playback(&[track], Some(&cancelled))?;
+                    let output = unique_batch_output_path(&output_dir, path, index + 1)?;
+                    let (inner_progress, inner_receiver) = mpsc::channel();
+                    let forwarded_progress = progress.clone();
+                    let start_progress = index as f32 / total as f32;
+                    let progress_span = 1.0 / total as f32;
+                    let forwarder = std::thread::spawn(move || {
+                        while let Ok(ExportMessage::Progress(value)) = inner_receiver.recv() {
+                            let _ = forwarded_progress.send(ExportMessage::Progress(
+                                start_progress + progress_span * value.clamp(0.0, 1.0),
+                            ));
+                        }
+                    });
+                    let write_result = write_mix_wav_controlled(
+                        &playback,
+                        &output,
+                        ExportSettings {
+                            sample_rate: playback.sample_rate,
+                            bit_depth: 24,
+                            range: None,
+                            normalize_peak: false,
+                        },
+                        &cancelled,
+                        &inner_progress,
+                    );
+                    drop(inner_progress);
+                    let _ = forwarder.join();
+                    write_result
+                })();
+                match result {
+                    Ok(()) => completed += 1,
+                    Err(error) if error == "Ekspor dibatalkan" || error == "Impor dibatalkan" => {
+                        let _ = progress.send(ExportMessage::Status(format!(
+                            "Batch dibatalkan; {completed}/{total} berkas berhasil disimpan"
+                        )));
+                        return Ok(());
+                    }
+                    Err(error) => failures.push(format!("{}: {error}", path.display())),
+                }
+                let _ = progress.send(ExportMessage::Progress((index + 1) as f32 / total as f32));
+                let _ = progress.send(ExportMessage::Status(format!(
+                    "Batch {} dari {total} · {completed} berhasil · {} gagal",
+                    index + 1,
+                    failures.len()
+                )));
+            }
+            if failures.is_empty() {
+                let _ = progress.send(ExportMessage::Status(format!(
+                    "Batch selesai: {completed}/{total} berkas berhasil disimpan"
+                )));
+            } else {
+                let preview = failures
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let tail = if failures.len() > 3 {
+                    format!("; dan {} kegagalan lain", failures.len() - 3)
+                } else {
+                    String::new()
+                };
+                let _ = progress.send(ExportMessage::Status(format!(
+                    "Batch selesai: {completed}/{total} berhasil; {} gagal. {preview}{tail}",
+                    failures.len()
+                )));
+            }
+            Ok(())
+        });
     }
     fn export_video_with_edited_audio(&mut self) {
         let Some(index) = self.selected_track else {
@@ -2858,6 +3228,7 @@ impl eframe::App for App {
         self.poll_import();
         self.poll_relink();
         self.poll_session_open();
+        self.poll_consolidation();
         self.update_track_meters();
         if self.mix_pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
@@ -2874,13 +3245,42 @@ impl eframe::App for App {
         if self.session_opening {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        let (undo, redo, split, duplicate, toggle) = ctx.input(|input| {
+        if self.consolidation_in_progress {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Menyiapkan proyek mandiri");
+                ui.label(
+                    self.status
+                        .as_deref()
+                        .unwrap_or("Menyalin media sumber ke folder proyek baru…"),
+                );
+                ui.weak("File sumber tetap utuh. Aplikasi menjaga sesi tetap konsisten sampai penyalinan selesai.");
+            });
+            return;
+        }
+        let keyboard_shortcuts_enabled = !ctx.wants_keyboard_input();
+        let (undo, redo, split, duplicate, toggle, save, open, import) = ctx.input(|input| {
             (
-                input.modifiers.command && input.key_pressed(egui::Key::Z),
-                input.modifiers.command && input.key_pressed(egui::Key::Y),
-                input.key_pressed(egui::Key::S),
-                input.modifiers.command && input.key_pressed(egui::Key::D),
-                input.key_pressed(egui::Key::Space),
+                keyboard_shortcuts_enabled
+                    && input.modifiers.command
+                    && input.key_pressed(egui::Key::Z),
+                keyboard_shortcuts_enabled
+                    && input.modifiers.command
+                    && input.key_pressed(egui::Key::Y),
+                keyboard_shortcuts_enabled && input.key_pressed(egui::Key::S),
+                keyboard_shortcuts_enabled
+                    && input.modifiers.command
+                    && input.key_pressed(egui::Key::D),
+                keyboard_shortcuts_enabled && input.key_pressed(egui::Key::Space),
+                keyboard_shortcuts_enabled
+                    && input.modifiers.command
+                    && input.key_pressed(egui::Key::S),
+                keyboard_shortcuts_enabled
+                    && input.modifiers.command
+                    && input.key_pressed(egui::Key::O),
+                keyboard_shortcuts_enabled
+                    && input.modifiers.command
+                    && input.key_pressed(egui::Key::I),
             )
         });
         if undo {
@@ -2898,9 +3298,19 @@ impl eframe::App for App {
         if toggle {
             self.toggle_playback();
         }
+        if save {
+            self.save_session();
+        }
+        if open {
+            self.open_session();
+        }
+        if import {
+            self.import_files();
+        }
         let mut style = (*ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(9.0, 7.0);
-        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.interact_size.y = 32.0;
         style.spacing.slider_width = 150.0;
         style.visuals.panel_fill = egui::Color32::from_rgb(15, 22, 29);
         style.visuals.window_fill = egui::Color32::from_rgb(24, 34, 43);
@@ -2911,9 +3321,28 @@ impl eframe::App for App {
         style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(42, 99, 91);
         style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(37, 133, 116);
         style.visuals.selection.bg_fill = egui::Color32::from_rgb(32, 112, 99);
+        style.visuals.widgets.active.bg_stroke =
+            egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(255, 220, 75));
+        style.visuals.widgets.hovered.bg_stroke =
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 220, 75));
+        if self.high_contrast {
+            style.visuals.panel_fill = egui::Color32::BLACK;
+            style.visuals.window_fill = egui::Color32::from_rgb(8, 8, 8);
+            style.visuals.extreme_bg_color = egui::Color32::BLACK;
+            style.visuals.faint_bg_color = egui::Color32::from_gray(28);
+            style.visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(44);
+            style.visuals.widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
+            style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0, 80, 170);
+            style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+            style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0, 115, 210);
+            style.visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+            style.visuals.selection.bg_fill = egui::Color32::from_rgb(0, 90, 190);
+        }
         ctx.set_style(style);
+        ctx.set_zoom_factor(self.ui_scale.clamp(0.8, 1.6));
 
         let mut export_settings_changed = false;
+        let mut accessibility_settings_changed = false;
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
@@ -3049,6 +3478,21 @@ impl eframe::App for App {
                     });
                     ui.menu_button("Efek", |ui| {
                         if ui
+                            .add_enabled(self.selected_track.is_some(), egui::Button::new("Simpan preset dari track…"))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.save_selected_preset();
+                        }
+                        if ui
+                            .add_enabled(self.selected_track.is_some(), egui::Button::new("Terapkan preset ke track…"))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.apply_preset_to_selected();
+                        }
+                        ui.separator();
+                        if ui
                             .add_enabled(!self.tracks.is_empty(), egui::Button::new("Simpan set A"))
                             .clicked()
                         {
@@ -3068,6 +3512,47 @@ impl eframe::App for App {
                         {
                             ui.close_menu();
                             self.toggle_ab();
+                        }
+                    });
+                    ui.menu_button("Proyek", |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.tracks.is_empty()
+                                    && !self.consolidation_in_progress
+                                    && !self.export_in_progress
+                                    && !self.import_in_progress
+                                    && !self.session_opening
+                                    && self.tracks.iter().all(|track| !track.offline),
+                                egui::Button::new("Konsolidasikan aset ke folder…"),
+                            )
+                            .on_hover_text("Salin media sumber dan simpan sesi mandiri ke folder proyek baru.")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.consolidate_assets();
+                        }
+                        if self.consolidation_in_progress {
+                            ui.label("Menyalin aset proyek…");
+                        }
+                    });
+                    ui.menu_button("Aksesibilitas", |ui| {
+                        accessibility_settings_changed |= ui
+                            .checkbox(&mut self.high_contrast, "Kontras tinggi")
+                            .on_hover_text("Meningkatkan kontras warna dan keterbacaan antarmuka.")
+                            .changed();
+                        accessibility_settings_changed |= ui
+                            .add(egui::Slider::new(&mut self.ui_scale, 0.8..=1.6).text("Skala antarmuka"))
+                            .changed();
+                        ui.weak("Preferensi disimpan di sesi. Tombol dan kontrol dapat dijangkau dengan Tab.");
+                    });
+                    ui.menu_button("Batch", |ui| {
+                        if ui
+                            .add_enabled(!self.export_in_progress, egui::Button::new("Proses beberapa berkas dengan preset…"))
+                            .on_hover_text("Pilih preset, berkas audio/video, dan folder output. Hasil berupa WAV PCM 24-bit.")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.start_batch_processing();
                         }
                     });
                     ui.menu_button("Ekspor", |ui| {
@@ -3184,6 +3669,9 @@ impl eframe::App for App {
         if export_settings_changed {
             self.last_edit = Some(std::time::Instant::now());
         }
+        if accessibility_settings_changed {
+            self.last_edit = Some(std::time::Instant::now());
+        }
         let mut denoise_profile_request = None;
         let mut alignment_request = None;
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -3193,7 +3681,8 @@ impl eframe::App for App {
                     ui.weak("Edit rekaman audio dan audio dari video. Sumber asli tetap aman.");
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("Space putar/jeda · S split · Ctrl/Cmd+Z undo · Ctrl/Cmd+D duplikasi");
+                    ui.weak("Space putar/jeda · S split · Ctrl/Cmd+I impor · Ctrl/Cmd+O buka · Ctrl/Cmd+S simpan");
+                    ui.weak("Ctrl/Cmd+Z/Y undo/redo · Ctrl/Cmd+D duplikasi");
                 });
             });
             ui.separator();
@@ -4108,6 +4597,126 @@ impl eframe::App for App {
     }
 }
 
+fn session_track_settings(tracks: &[Track], session_path: &std::path::Path) -> Vec<TrackSettings> {
+    let session_directory = session_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    tracks
+        .iter()
+        .map(|track| {
+            let mut settings = track.settings.clone();
+            if let Ok(relative) =
+                std::path::Path::new(&settings.path).strip_prefix(session_directory)
+            {
+                settings.path = relative.display().to_string();
+            }
+            settings
+        })
+        .collect()
+}
+
+fn consolidate_session_bundle(
+    parent: &std::path::Path,
+    mut session: SessionFile,
+) -> Result<ConsolidationResult, String> {
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let parent = parent.canonicalize().map_err(|error| error.to_string())?;
+    let (project_dir, staging_dir) = (1..=10_000usize)
+        .find_map(|suffix| {
+            let name = if suffix == 1 {
+                "iZotay Project".to_owned()
+            } else {
+                format!("iZotay Project {suffix}")
+            };
+            let project = parent.join(name);
+            let staging = parent.join(format!(".izotay-project-{suffix}.partial"));
+            (!project.exists() && !staging.exists()).then_some((project, staging))
+        })
+        .ok_or_else(|| "Tidak menemukan nama folder proyek yang tersedia".to_owned())?;
+    std::fs::create_dir(&staging_dir).map_err(|error| error.to_string())?;
+    let result = (|| -> Result<ConsolidationResult, String> {
+        let media_dir = staging_dir.join("Media");
+        std::fs::create_dir(&media_dir).map_err(|error| error.to_string())?;
+        let mut copied = std::collections::HashMap::<
+            std::path::PathBuf,
+            (std::path::PathBuf, std::path::PathBuf),
+        >::new();
+        let mut used_names = std::collections::HashSet::<String>::new();
+        let mut final_paths = Vec::with_capacity(session.tracks.len());
+        for track in &mut session.tracks {
+            let source = std::path::PathBuf::from(&track.path);
+            let canonical = source.canonicalize().map_err(|error| {
+                format!(
+                    "Sumber media {} tidak dapat dibaca: {error}",
+                    source.display()
+                )
+            })?;
+            if !canonical.is_file() {
+                return Err(format!("Sumber media bukan berkas: {}", source.display()));
+            }
+            let (relative_destination, final_destination) = if let Some(existing) =
+                copied.get(&canonical)
+            {
+                existing.clone()
+            } else {
+                let filename = canonical
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("media");
+                let original = std::path::Path::new(filename);
+                let stem = original
+                    .file_stem()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("media");
+                let extension = original.extension().and_then(|v| v.to_str());
+                let destination = (1..=10_000usize)
+                    .find_map(|suffix| {
+                        let candidate = if suffix == 1 {
+                            filename.to_owned()
+                        } else if let Some(extension) = extension {
+                            format!("{stem}-{suffix}.{extension}")
+                        } else {
+                            format!("{filename}-{suffix}")
+                        };
+                        used_names
+                            .insert(candidate.to_lowercase())
+                            .then(|| media_dir.join(candidate))
+                    })
+                    .ok_or_else(|| "Nama berkas media duplikat terlalu banyak".to_owned())?;
+                std::fs::copy(&canonical, &destination)
+                    .map_err(|error| format!("Gagal menyalin {}: {error}", canonical.display()))?;
+                let filename = destination
+                    .file_name()
+                    .ok_or_else(|| "Nama berkas media tidak valid".to_owned())?;
+                let relative_destination = std::path::PathBuf::from("Media").join(filename);
+                let final_destination = project_dir.join(&relative_destination);
+                copied.insert(
+                    canonical,
+                    (relative_destination.clone(), final_destination.clone()),
+                );
+                (relative_destination, final_destination)
+            };
+            track.path = relative_destination.display().to_string();
+            final_paths.push(final_destination.display().to_string());
+        }
+        let session_path = project_dir.join("Project.izotay");
+        let session_bytes =
+            serde_json::to_vec_pretty(&session).map_err(|error| error.to_string())?;
+        std::fs::write(staging_dir.join("Project.izotay"), session_bytes)
+            .map_err(|error| error.to_string())?;
+        std::fs::rename(&staging_dir, &project_dir).map_err(|error| error.to_string())?;
+        Ok(ConsolidationResult {
+            paths: final_paths,
+            session_path,
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+    result
+}
+
 fn autosave_path(path: &std::path::Path) -> std::path::PathBuf {
     path.with_extension("autosave.izotay")
 }
@@ -4140,6 +4749,101 @@ fn default_hum_frequency() -> u32 {
 
 fn default_export_bit_depth() -> u16 {
     24
+}
+
+fn validate_preset_effects(mut effects: EffectSettings) -> Result<EffectSettings, String> {
+    effects.denoise_profile_range = None;
+    effects.bleed_enabled = false;
+    effects.bleed_reference_track_id = None;
+    effects.bleed_alignment_offset_ms = 0.0;
+    if !effects.rumble_cutoff_hz.is_finite()
+        || !(0.0..=180.0).contains(&effects.rumble_cutoff_hz)
+        || !matches!(effects.hum_frequency_hz, 50 | 60)
+        || !effects.gate_threshold_db.is_finite()
+        || !(-60.0..=-20.0).contains(&effects.gate_threshold_db)
+        || !effects.denoise_reduction_db.is_finite()
+        || !(0.0..=30.0).contains(&effects.denoise_reduction_db)
+        || !effects.deesser_threshold_db.is_finite()
+        || !(-60.0..=0.0).contains(&effects.deesser_threshold_db)
+        || !effects.deesser_reduction_db.is_finite()
+        || !(0.0..=18.0).contains(&effects.deesser_reduction_db)
+        || !effects.dereverb_amount.is_finite()
+        || !(0.0..=1.0).contains(&effects.dereverb_amount)
+    {
+        return Err("Preset memiliki nilai restorasi di luar rentang yang didukung".into());
+    }
+    Ok(effects)
+}
+
+fn read_production_preset(path: &std::path::Path) -> Result<ProductionPreset, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let mut preset: ProductionPreset =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if preset.format_version != 1 {
+        return Err(format!(
+            "Versi preset {} tidak didukung",
+            preset.format_version
+        ));
+    }
+    preset.name = preset.name.trim().chars().take(64).collect();
+    if preset.name.is_empty() {
+        return Err("Nama preset kosong".into());
+    }
+    preset.effects = validate_preset_effects(preset.effects)?;
+    Ok(preset)
+}
+
+fn write_production_preset(
+    preset: &ProductionPreset,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    if preset.format_version != 1 {
+        return Err("Versi preset yang akan disimpan tidak didukung".into());
+    }
+    let name = preset.name.trim().chars().take(64).collect::<String>();
+    if name.is_empty() {
+        return Err("Nama preset kosong".into());
+    }
+    let normalized = ProductionPreset {
+        format_version: 1,
+        name,
+        effects: validate_preset_effects(preset.effects.clone())?,
+    };
+    let bytes = serde_json::to_vec_pretty(&normalized).map_err(|error| error.to_string())?;
+    let temp = path.with_extension("izopreset.tmp");
+    std::fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+    if let Err(error) = replace_output(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn unique_batch_output_path(
+    output_dir: &std::path::Path,
+    input: &std::path::Path,
+    sequence: usize,
+) -> Result<std::path::PathBuf, String> {
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("audio");
+    for suffix in 1..=10_000usize {
+        let postfix = if suffix == 1 {
+            String::new()
+        } else {
+            format!("-{:02}", suffix)
+        };
+        let path = output_dir.join(format!("{stem}_restored{postfix}.wav"));
+        let temporary = path.with_extension("wav.part");
+        if !path.exists() && !temporary.exists() {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "Tidak ada nama output unik untuk berkas ke-{sequence}"
+    ))
 }
 
 fn denoise_samples_controlled(
@@ -7330,7 +8034,7 @@ mod tests {
         app.tracks.push(reference_track);
         app.write_session_to(&path).unwrap();
         let session: SessionFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(session.format_version, 16);
+        assert_eq!(session.format_version, 17);
         assert_eq!(session.tracks.len(), 2);
         assert_eq!(session.tracks[0].denoise_profile_range, Some((1.25, 2.75)));
         assert!(session.tracks[0].declick_enabled);
